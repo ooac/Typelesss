@@ -291,6 +291,10 @@ select {
   line-height: 1.05;
 }
 
+.capsule-topline span {
+  color: var(--signal);
+}
+
 .capsule-topline strong {
   color: var(--signal);
   font-size: 12px;

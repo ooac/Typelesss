@@ -35,7 +35,8 @@ export function CapsuleWindow() {
   }, []);
 
   const elapsed = payload.startedAt ? Math.max(0, now - payload.startedAt) : 0;
-  const elapsedText = payload.state === "recording" ? formatElapsed(elapsed) : stateLabel(payload.state);
+  const elapsedText = formatElapsed(elapsed);
+  const shouldShowElapsed = payload.state === "recording";
   const detailText = capsuleDetailText(payload);
   const startCapsuleDrag = (event: PointerEvent<HTMLElement>) => {
     if (event.button !== 0) return;
@@ -51,7 +52,7 @@ export function CapsuleWindow() {
         <div className="capsule-copy">
           <div className="capsule-topline">
             <span>{stateLabel(payload.state)}</span>
-            <strong>{elapsedText}</strong>
+            {shouldShowElapsed ? <strong>{elapsedText}</strong> : null}
           </div>
           <p>{detailText}</p>
         </div>
