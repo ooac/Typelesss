@@ -1,0 +1,34 @@
+{
+  "name": "openless-realtime-input-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenLess Typeless-grade realtime input core prototype for zh/en/mixed dictation.",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "dmg:build": "mkdir -p src-tauri/target/release/bundle/dmg && hdiutil create -volname 'OpenLess Realtime Input' -srcfolder 'src-tauri/target/release/bundle/macos/OpenLess Realtime Input.app' -ov -format UDZO 'src-tauri/target/release/bundle/dmg/OpenLess Realtime Input_0.1.0_aarch64.dmg'",
+    "release:mac": "npm run tauri:build && npm run dmg:build",
+    "build": "tsc -p tsconfig.json && vite build",
+    "test": "node --import tsx --test \"test/**/*.test.ts\"",
+    "check": "npm run build && npm test"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.1",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vite": "^8.0.10"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.0",
+    "@tauri-apps/plugin-global-shortcut": "^2.3.1",
+    "lucide-react": "^1.14.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6"
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "OpenLess Realtime Input",
+  "version": "0.1.0",
+  "identifier": "com.openless.realtime-input",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "title": "OpenLess Realtime Input",
+        "width": 1120,
+        "height": 820,
+        "minWidth": 980,
+        "minHeight": 720
+      },
+      {
+        "label": "capsule",
+        "title": "OpenLess Capsule",
+        "url": "index.html#/capsule",
+        "width": 360,
+        "height": 70,
+        "minWidth": 360,
+        "minHeight": 70,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "backgroundColor": "#00000000",
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "x": 760,
+        "y": 80
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "category": "Productivity",
+    "shortDescription": "Realtime voice input for zh/en/mixed dictation",
+    "longDescription": "A macOS-first voice input app that records speech, transcribes it through configurable ASR providers, polishes the text, and inserts it at the current cursor.",
+    "macOS": {
+      "minimumSystemVersion": "12.0",
+      "signingIdentity": null,
+      "entitlements": "Entitlements.plist",
+      "exceptionDomain": "",
+      "frameworks": []
+    }
+  }
+}
