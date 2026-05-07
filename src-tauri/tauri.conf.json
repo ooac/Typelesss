@@ -45,6 +45,13 @@
   "bundle": {
     "active": true,
     "targets": ["app"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
     "category": "Productivity",
     "shortDescription": "Realtime voice input for zh/en/mixed dictation",
     "longDescription": "A macOS-first voice input app that records speech, transcribes it through configurable ASR providers, polishes the text, and inserts it at the current cursor.",
