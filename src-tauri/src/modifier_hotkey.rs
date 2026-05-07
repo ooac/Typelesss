@@ -56,7 +56,7 @@ impl ModifierHotkeyState {
 
             if result.is_err() {
                 let _ = sender.send(Err(
-                    "右 Option 监听启动失败。请在系统设置中给 OpenLess Realtime Input 开启输入监控和辅助功能权限。".to_string(),
+                    "右 Option 监听启动失败。请在系统设置中给 Typelesss 开启输入监控和辅助功能权限。".to_string(),
                 ));
             }
         });
@@ -91,7 +91,7 @@ fn ensure_input_monitoring_permission() -> Result<(), String> {
         Ok(())
     } else {
         Err(
-            "Right Option 需要输入监控权限。请在系统设置 > 隐私与安全性 > 输入监控 中允许 OpenLess Realtime Input，然后重启 App。"
+            "Right Option 需要输入监控权限。请在系统设置 > 隐私与安全性 > 输入监控 中允许 Typelesss，然后重启 App。"
                 .to_string(),
         )
     }

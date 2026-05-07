@@ -1,14 +1,14 @@
 {
-  "name": "openless-realtime-input-core",
+  "name": "typelesss",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "OpenLess Typeless-grade realtime input core prototype for zh/en/mixed dictation.",
+  "description": "Typelesss realtime input app for zh/en/mixed dictation.",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "dmg:build": "mkdir -p src-tauri/target/release/bundle/dmg && hdiutil create -volname 'OpenLess Realtime Input' -srcfolder 'src-tauri/target/release/bundle/macos/OpenLess Realtime Input.app' -ov -format UDZO 'src-tauri/target/release/bundle/dmg/OpenLess Realtime Input_0.1.0_aarch64.dmg'",
+    "dmg:build": "mkdir -p src-tauri/target/release/bundle/dmg && hdiutil create -volname 'Typelesss' -srcfolder 'src-tauri/target/release/bundle/macos/Typelesss.app' -ov -format UDZO 'src-tauri/target/release/bundle/dmg/Typelesss_0.1.0_aarch64.dmg'",
     "release:mac": "npm run tauri:build && npm run dmg:build",
     "build": "tsc -p tsconfig.json && vite build",
     "test": "node --import tsx --test \"test/**/*.test.ts\"",

@@ -3,10 +3,10 @@
 <plist version="1.0">
 <dict>
   <key>NSMicrophoneUsageDescription</key>
-  <string>OpenLess Realtime Input 需要使用麦克风录制语音，并将语音转写成可插入当前光标的文字。</string>
+  <string>Typelesss 需要使用麦克风录制语音，并将语音转写成可插入当前光标的文字。</string>
   <key>NSAppleEventsUsageDescription</key>
-  <string>OpenLess Realtime Input 需要通过系统事件执行粘贴操作，把整理后的文字插入当前光标。</string>
+  <string>Typelesss 需要通过系统事件执行粘贴操作，把整理后的文字插入当前光标。</string>
   <key>NSInputMonitoringUsageDescription</key>
-  <string>OpenLess Realtime Input 需要监听用户设置的全局快捷键，例如键盘右侧 Option，用于按住录音和松开转写。</string>
+  <string>Typelesss 需要监听用户设置的全局快捷键，例如键盘右侧 Option，用于按住录音和松开转写。</string>
 </dict>
 </plist>

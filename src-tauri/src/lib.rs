@@ -141,12 +141,12 @@ fn open_accessibility_settings() -> Result<(), String> {
 #[tauri::command]
 fn install_to_applications_and_open_input_monitoring() -> Result<String, String> {
     let source_app = current_app_bundle_path()?;
-    let target_app = PathBuf::from("/Applications/OpenLess Realtime Input.app");
+    let target_app = PathBuf::from("/Applications/Typelesss.app");
     if same_path(&source_app, &target_app) {
         let _ = open_input_monitoring_settings();
         let _ = open_accessibility_settings();
         return Ok(
-            "当前 App 已在 /Applications。已打开输入监控和辅助功能授权页，请勾选 OpenLess Realtime Input 后重启 App。"
+            "当前 App 已在 /Applications。已打开输入监控和辅助功能授权页，请勾选 Typelesss 后重启 App。"
                 .to_string(),
         );
     }
@@ -176,7 +176,7 @@ fn install_to_applications_and_open_input_monitoring() -> Result<String, String>
     let _ = Command::new("open").arg("-R").arg(&target_app).status();
     let _ = open_input_monitoring_settings();
     let _ = open_accessibility_settings();
-    Ok("已安装到 /Applications。请在输入监控和辅助功能中添加或允许 OpenLess Realtime Input，然后从应用程序文件夹重启 App。".to_string())
+    Ok("已安装到 /Applications。请在输入监控和辅助功能中添加或允许 Typelesss，然后从应用程序文件夹重启 App。".to_string())
 }
 
 fn current_app_bundle_path() -> Result<PathBuf, String> {

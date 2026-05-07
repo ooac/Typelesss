@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "OpenLess Realtime Input",
+  "productName": "Typelesss",
   "version": "0.1.0",
   "identifier": "com.openless.realtime-input",
   "build": {
@@ -13,7 +13,7 @@
     "macOSPrivateApi": true,
     "windows": [
       {
-        "title": "OpenLess Realtime Input",
+        "title": "Typelesss",
         "width": 1120,
         "height": 820,
         "minWidth": 980,
@@ -21,7 +21,7 @@
       },
       {
         "label": "capsule",
-        "title": "OpenLess Capsule",
+        "title": "Typelesss Capsule",
         "url": "index.html#/capsule",
         "width": 360,
         "height": 70,

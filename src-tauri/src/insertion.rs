@@ -48,7 +48,7 @@ pub fn capture_insert_target() -> Result<Option<InsertTarget>> {
             r#"tell application "System Events" to return (unix id of frontApp as text) & linefeed & (name of frontApp as text)"#,
         ])
         .output()
-        .context("无法记录当前输入框所在 App。请给 OpenLess Realtime Input 授权辅助功能权限")?;
+        .context("无法记录当前输入框所在 App。请给 Typelesss 授权辅助功能权限")?;
 
     if !output.status.success() {
         return Ok(None);
@@ -101,7 +101,7 @@ pub fn paste_text(text: &str, target: Option<&InsertTarget>) -> Result<String> {
         Ok(format!("{target_message}已通过剪贴板粘贴到当前光标。"))
     } else {
         Err(anyhow!(
-            "自动粘贴失败，文本已复制到剪贴板。请在系统设置中给 OpenLess Realtime Input 授权辅助功能权限，或手动按 Command+V。"
+            "自动粘贴失败，文本已复制到剪贴板。请在系统设置中给 Typelesss 授权辅助功能权限，或手动按 Command+V。"
         ))
     }
 }

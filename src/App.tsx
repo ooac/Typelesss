@@ -146,7 +146,7 @@ export default function App() {
   async function openInputMonitoringSettings() {
     try {
       await invoke("open_input_monitoring_settings");
-      setStatus("已打开输入监控授权页面。授权 OpenLess Realtime Input 后请重启 App。");
+      setStatus("已打开输入监控授权页面。授权 Typelesss 后请重启 App。");
     } catch (err) {
       setError(String(err));
     }
@@ -155,7 +155,7 @@ export default function App() {
   async function openAccessibilitySettings() {
     try {
       await invoke("open_accessibility_settings");
-      setStatus("已打开辅助功能授权页面。授权 OpenLess Realtime Input 后请重启 App。");
+      setStatus("已打开辅助功能授权页面。授权 Typelesss 后请重启 App。");
     } catch (err) {
       setError(String(err));
     }
@@ -255,7 +255,7 @@ export default function App() {
         </div>
 
         <div className="title-block">
-          <p className="eyebrow">OpenLess Realtime Input</p>
+          <p className="eyebrow">Typelesss</p>
           <h1>面向中文、英文和中英混输的桌面语音输入。</h1>
           <p className="summary">
             录音后走 ASR、FastNormalizer、可选 polish，并把最终文本粘贴到当前光标。第一版 macOS 优先。

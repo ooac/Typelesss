@@ -1,4 +1,4 @@
-# OpenLess Realtime Input
+# Typelesss
 
 macOS 优先的桌面语音输入程序原型。当前版本支持在桌面 App 内录音，将音频发送到硅基流动 Whisper-compatible ASR，再通过本地 FastNormalizer 和 DeepSeek/OpenAI-compatible polish 整理文本，最后复制或粘贴到当前光标。
 
@@ -33,8 +33,8 @@ npm run release:mac
 构建产物：
 
 ```text
-src-tauri/target/release/bundle/macos/OpenLess Realtime Input.app
-src-tauri/target/release/bundle/dmg/OpenLess Realtime Input_0.1.0_aarch64.dmg
+src-tauri/target/release/bundle/macos/Typelesss.app
+src-tauri/target/release/bundle/dmg/Typelesss_0.1.0_aarch64.dmg
 ```
 
 ## API 配置
@@ -50,10 +50,10 @@ src-tauri/target/release/bundle/dmg/OpenLess Realtime Input_0.1.0_aarch64.dmg
 - 全局快捷键：点击设置页快捷键输入框后直接按新组合键录入，默认 `Option+Space`
 - 也支持单键快捷键，例如 `F9` 或 `D`；如果和正常输入冲突，请换成不常用按键。
 - 右侧 Option 可单独作为快捷键：点击快捷键输入框后按键盘右侧 Option，保存后显示 `Right Option`。这个模式是按住说话、松开处理。
-- `Right Option` 需要 macOS 输入监控权限：系统设置 > 隐私与安全性 > 输入监控 > 添加并允许 `OpenLess Realtime Input`，授权后重启 App。
+- `Right Option` 需要 macOS 输入监控权限：系统设置 > 隐私与安全性 > 输入监控 > 添加并允许 `Typelesss`，授权后重启 App。
 - App 内提供“打开输入监控授权”按钮，可直接拉起对应系统设置页。
 - 自动插入到其他 App 输入框需要 macOS 辅助功能权限：App 内提供“打开辅助功能授权”按钮。
-- App 内也提供“安装到应用程序并打开授权”按钮，会复制到 `/Applications/OpenLess Realtime Input.app`，方便在输入监控列表中选择。
+- App 内也提供“安装到应用程序并打开授权”按钮，会复制到 `/Applications/Typelesss.app`，方便在输入监控列表中选择。
 
 推荐配置：
 - ASR Endpoint：`https://api.siliconflow.cn/v1/audio/transcriptions`
