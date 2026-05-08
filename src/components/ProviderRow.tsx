@@ -8,9 +8,18 @@ interface ProviderRowProps {
   status?: ReactNode;
   onClick?: () => void;
   disabled?: boolean;
+  expanded?: boolean;
 }
 
-export function ProviderRow({ icon, label, value, status, onClick, disabled }: ProviderRowProps) {
+export function ProviderRow({
+  icon,
+  label,
+  value,
+  status,
+  onClick,
+  disabled,
+  expanded = false,
+}: ProviderRowProps) {
   const interactive = Boolean(onClick) && !disabled;
   return (
     <button
@@ -27,7 +36,11 @@ export function ProviderRow({ icon, label, value, status, onClick, disabled }: P
       <div className="provider-row__tail">
         {status ? <div className="provider-row__status">{status}</div> : null}
         {interactive ? (
-          <ChevronRight size={18} className="provider-row__chevron" aria-hidden="true" />
+          <ChevronRight
+            size={18}
+            className={`provider-row__chevron ${expanded ? "is-expanded" : ""}`}
+            aria-hidden="true"
+          />
         ) : null}
       </div>
     </button>

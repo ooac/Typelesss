@@ -9,8 +9,7 @@ import {
   Wand2,
   Wrench,
 } from "lucide-react";
-import { useState } from "react";
-import { Drawer } from "./Drawer.js";
+import { useCallback, useState, type FocusEvent } from "react";
 import { HealthChip } from "./HealthChip.js";
 import { ProviderRow } from "./ProviderRow.js";
 import { SecretField } from "./SecretField.js";
@@ -66,18 +65,162 @@ export function ProviderEditor({
   const [editing, setEditing] = useState<EditorId | null>(null);
   const [draft, setDraft] = useState<AppConfig>(config);
 
-  const openEditor = (id: EditorId) => {
-    setDraft(config);
-    setEditing(id);
-  };
-  const closeEditor = () => setEditing(null);
-  const saveAndClose = async () => {
-    await updateAndSaveConfig(diffPatch(config, draft));
-    closeEditor();
-  };
+  const saveDraft = useCallback(async () => {
+    const patch = diffPatch(config, draft);
+    if (Object.keys(patch).length === 0) return;
+    await updateAndSaveConfig(patch);
+  }, [config, draft, updateAndSaveConfig]);
+
+  const openEditor = useCallback(
+    async (id: EditorId) => {
+      if (editing === id) {
+        await saveDraft();
+        setEditing(null);
+        return;
+      }
+      if (editing) {
+        await saveDraft();
+      }
+      const patch = diffPatch(config, draft);
+      const base = Object.keys(patch).length > 0 ? ({ ...config, ...patch } as AppConfig) : config;
+      setDraft(base);
+      setEditing(id);
+    },
+    [config, draft, editing, saveDraft],
+  );
+
+  const handleInlineBlur = useCallback(
+    (event: FocusEvent<HTMLDivElement>) => {
+      const next = event.relatedTarget as Node | null;
+      if (next && event.currentTarget.contains(next)) return;
+      void saveDraft();
+      setEditing(null);
+    },
+    [saveDraft],
+  );
 
   const isAsrVolcengine = config.asrProvider === "volcengine";
   const draftAsrIsVolcengine = draft.asrProvider === "volcengine";
+
+  const renderInlineEditor = (id: EditorId) => {
+    if (editing !== id) return null;
+    return (
+      <div className="provider-inline-editor" onBlurCapture={handleInlineBlur}>
+        {id === "asrProvider" ? (
+          <SelectField
+            label="ASR 服务商"
+            value={draft.asrProvider}
+            options={[
+              { value: "whisper_compatible", label: ASR_PROVIDER_LABEL.whisper_compatible },
+              { value: "volcengine", label: ASR_PROVIDER_LABEL.volcengine },
+            ]}
+            onChange={(value) => setDraft({ ...draft, asrProvider: value as AsrProvider })}
+          />
+        ) : null}
+
+        {(id === "volcengine" || (id === "asrProvider" && draftAsrIsVolcengine)) ? (
+          <>
+            <TextField
+              label="Volcengine App ID"
+              value={draft.volcengineAppId}
+              onChange={(value) => setDraft({ ...draft, volcengineAppId: value })}
+            />
+            <TextField
+              label="Volcengine Resource ID"
+              value={draft.volcengineResourceId}
+              onChange={(value) => setDraft({ ...draft, volcengineResourceId: value })}
+            />
+            <SecretField
+              label="Volcengine 访问令牌"
+              value={draft.volcengineAccessToken}
+              hasSavedSecret={secrets.volcengineAccessToken}
+              onChange={(value) => setDraft({ ...draft, volcengineAccessToken: value })}
+            />
+          </>
+        ) : null}
+
+        {id === "asrModel" ? (
+          <TextField
+            label="ASR 模型"
+            value={draft.asrModel}
+            placeholder="FunAudioLLM/SenseVoiceSmall"
+            onChange={(value) => setDraft({ ...draft, asrModel: value })}
+          />
+        ) : null}
+
+        {id === "asrEndpoint" ? (
+          <TextField
+            label="ASR 接口"
+            value={draft.asrEndpoint}
+            placeholder="https://api.siliconflow.cn/v1/audio/transcriptions"
+            onChange={(value) => setDraft({ ...draft, asrEndpoint: value })}
+          />
+        ) : null}
+
+        {id === "asrApiKey" ? (
+          <SecretField
+            label="ASR API Key"
+            value={draft.asrApiKey}
+            hasSavedSecret={secrets.asrApiKey}
+            onChange={(value) => setDraft({ ...draft, asrApiKey: value })}
+          />
+        ) : null}
+
+        {id === "polishProvider" ? (
+          <SelectField
+            label="润色服务商"
+            value={draft.polishProvider}
+            options={[
+              { value: "openai_compatible", label: POLISH_PROVIDER_LABEL.openai_compatible },
+              { value: "disabled", label: POLISH_PROVIDER_LABEL.disabled },
+            ]}
+            onChange={(value) => setDraft({ ...draft, polishProvider: value as PolishProvider })}
+          />
+        ) : null}
+
+        {id === "polishModel" ? (
+          <TextField
+            label="润色模型"
+            value={draft.polishModel}
+            placeholder="deepseek-v4-flash"
+            onChange={(value) => setDraft({ ...draft, polishModel: value })}
+          />
+        ) : null}
+
+        {id === "polishEndpoint" ? (
+          <TextField
+            label="润色接口"
+            value={draft.polishEndpoint}
+            placeholder="https://api.deepseek.com/v1"
+            onChange={(value) => setDraft({ ...draft, polishEndpoint: value })}
+          />
+        ) : null}
+
+        {id === "polishApiKey" ? (
+          <SecretField
+            label="润色 API Key"
+            value={draft.polishApiKey}
+            hasSavedSecret={secrets.polishApiKey}
+            onChange={(value) => setDraft({ ...draft, polishApiKey: value })}
+          />
+        ) : null}
+
+        {id === "outputMode" ? (
+          <SelectField
+            label="输出模式"
+            value={draft.outputMode}
+            options={[
+              { value: "fast_dictation", label: OUTPUT_MODE_LABEL.fast_dictation },
+              { value: "smart_polish", label: OUTPUT_MODE_LABEL.smart_polish },
+              { value: "prompt_builder", label: OUTPUT_MODE_LABEL.prompt_builder },
+              { value: "code_prompt", label: OUTPUT_MODE_LABEL.code_prompt },
+            ]}
+            onChange={(value) => setDraft({ ...draft, outputMode: value as DictationMode })}
+          />
+        ) : null}
+      </div>
+    );
+  };
 
   return (
     <>
@@ -100,31 +243,41 @@ export function ProviderEditor({
         icon={<CloudCog size={16} />}
         label="ASR 服务商"
         value={ASR_PROVIDER_LABEL[config.asrProvider] ?? config.asrProvider}
-        onClick={() => openEditor("asrProvider")}
+        expanded={editing === "asrProvider"}
+        onClick={() => void openEditor("asrProvider")}
       />
+      {renderInlineEditor("asrProvider")}
       {isAsrVolcengine ? (
-        <ProviderRow
-          icon={<Database size={16} />}
-          label="Volcengine 凭证"
-          value={config.volcengineAppId ? `App ID ${config.volcengineAppId}` : "未配置"}
-          status={<HealthChip probe={asr} />}
-          onClick={() => openEditor("volcengine")}
-        />
+        <>
+          <ProviderRow
+            icon={<Database size={16} />}
+            label="Volcengine 凭证"
+            value={config.volcengineAppId ? `App ID ${config.volcengineAppId}` : "未配置"}
+            status={<HealthChip probe={asr} />}
+            expanded={editing === "volcengine"}
+            onClick={() => void openEditor("volcengine")}
+          />
+          {renderInlineEditor("volcengine")}
+        </>
       ) : (
         <>
           <ProviderRow
             icon={<Cpu size={16} />}
             label="ASR 模型"
             value={config.asrModel || "未配置"}
-            onClick={() => openEditor("asrModel")}
+            expanded={editing === "asrModel"}
+            onClick={() => void openEditor("asrModel")}
           />
+          {renderInlineEditor("asrModel")}
           <ProviderRow
             icon={<Link2 size={16} />}
             label="ASR 接口"
             value={truncateUrl(config.asrEndpoint)}
             status={<HealthChip probe={asr} />}
-            onClick={() => openEditor("asrEndpoint")}
+            expanded={editing === "asrEndpoint"}
+            onClick={() => void openEditor("asrEndpoint")}
           />
+          {renderInlineEditor("asrEndpoint")}
           <ProviderRow
             icon={<Key size={16} />}
             label="ASR API Key"
@@ -132,8 +285,10 @@ export function ProviderEditor({
             status={
               secrets.asrApiKey ? <span className="status-chip saved">已保存</span> : null
             }
-            onClick={() => openEditor("asrApiKey")}
+            expanded={editing === "asrApiKey"}
+            onClick={() => void openEditor("asrApiKey")}
           />
+          {renderInlineEditor("asrApiKey")}
         </>
       )}
 
@@ -142,23 +297,29 @@ export function ProviderEditor({
         icon={<Wand2 size={16} />}
         label="润色服务商"
         value={POLISH_PROVIDER_LABEL[config.polishProvider] ?? config.polishProvider}
-        onClick={() => openEditor("polishProvider")}
+        expanded={editing === "polishProvider"}
+        onClick={() => void openEditor("polishProvider")}
       />
+      {renderInlineEditor("polishProvider")}
       {config.polishProvider !== "disabled" ? (
         <>
           <ProviderRow
             icon={<Cpu size={16} />}
             label="润色模型"
             value={config.polishModel || "未配置"}
-            onClick={() => openEditor("polishModel")}
+            expanded={editing === "polishModel"}
+            onClick={() => void openEditor("polishModel")}
           />
+          {renderInlineEditor("polishModel")}
           <ProviderRow
             icon={<Link2 size={16} />}
             label="润色接口"
             value={truncateUrl(config.polishEndpoint)}
             status={<HealthChip probe={polish} />}
-            onClick={() => openEditor("polishEndpoint")}
+            expanded={editing === "polishEndpoint"}
+            onClick={() => void openEditor("polishEndpoint")}
           />
+          {renderInlineEditor("polishEndpoint")}
           <ProviderRow
             icon={<Key size={16} />}
             label="润色 API Key"
@@ -166,8 +327,10 @@ export function ProviderEditor({
             status={
               secrets.polishApiKey ? <span className="status-chip saved">已保存</span> : null
             }
-            onClick={() => openEditor("polishApiKey")}
+            expanded={editing === "polishApiKey"}
+            onClick={() => void openEditor("polishApiKey")}
           />
+          {renderInlineEditor("polishApiKey")}
         </>
       ) : null}
 
@@ -176,8 +339,10 @@ export function ProviderEditor({
         icon={<Sparkles size={16} />}
         label="输出模式"
         value={OUTPUT_MODE_LABEL[config.outputMode] ?? config.outputMode}
-        onClick={() => openEditor("outputMode")}
+        expanded={editing === "outputMode"}
+        onClick={() => void openEditor("outputMode")}
       />
+      {renderInlineEditor("outputMode")}
       {showAutoInsertRow ? (
         <div className="provider-row is-static provider-row--inline">
           <span className="provider-row__icon">
@@ -203,136 +368,6 @@ export function ProviderEditor({
           </label>
         </div>
       ) : null}
-
-      <Drawer
-        open={editing !== null}
-        title={editorTitle(editing)}
-        description={editorDescription(editing)}
-        onClose={closeEditor}
-        footer={
-          <>
-            <button type="button" className="ghost compact" onClick={closeEditor}>
-              取消
-            </button>
-            <button type="button" className="primary" onClick={() => void saveAndClose()}>
-              保存
-            </button>
-          </>
-        }
-      >
-        {editing === "asrProvider" ? (
-          <SelectField
-            label="ASR 服务商"
-            value={draft.asrProvider}
-            options={[
-              { value: "whisper_compatible", label: ASR_PROVIDER_LABEL.whisper_compatible },
-              { value: "volcengine", label: ASR_PROVIDER_LABEL.volcengine },
-            ]}
-            onChange={(value) => setDraft({ ...draft, asrProvider: value as AsrProvider })}
-          />
-        ) : null}
-
-        {editing === "asrModel" ? (
-          <TextField
-            label="ASR 模型"
-            value={draft.asrModel}
-            placeholder="FunAudioLLM/SenseVoiceSmall"
-            onChange={(value) => setDraft({ ...draft, asrModel: value })}
-          />
-        ) : null}
-
-        {editing === "asrEndpoint" ? (
-          <TextField
-            label="ASR 接口"
-            value={draft.asrEndpoint}
-            placeholder="https://api.siliconflow.cn/v1/audio/transcriptions"
-            onChange={(value) => setDraft({ ...draft, asrEndpoint: value })}
-          />
-        ) : null}
-
-        {editing === "asrApiKey" ? (
-          <SecretField
-            label="ASR API Key"
-            value={draft.asrApiKey}
-            hasSavedSecret={secrets.asrApiKey}
-            onChange={(value) => setDraft({ ...draft, asrApiKey: value })}
-          />
-        ) : null}
-
-        {editing === "volcengine" || (draftAsrIsVolcengine && editing === "asrProvider") ? (
-          <>
-            <TextField
-              label="Volcengine App ID"
-              value={draft.volcengineAppId}
-              onChange={(value) => setDraft({ ...draft, volcengineAppId: value })}
-            />
-            <TextField
-              label="Volcengine Resource ID"
-              value={draft.volcengineResourceId}
-              onChange={(value) => setDraft({ ...draft, volcengineResourceId: value })}
-            />
-            <SecretField
-              label="Volcengine 访问令牌"
-              value={draft.volcengineAccessToken}
-              hasSavedSecret={secrets.volcengineAccessToken}
-              onChange={(value) => setDraft({ ...draft, volcengineAccessToken: value })}
-            />
-          </>
-        ) : null}
-
-        {editing === "polishProvider" ? (
-          <SelectField
-            label="润色服务商"
-            value={draft.polishProvider}
-            options={[
-              { value: "openai_compatible", label: POLISH_PROVIDER_LABEL.openai_compatible },
-              { value: "disabled", label: POLISH_PROVIDER_LABEL.disabled },
-            ]}
-            onChange={(value) => setDraft({ ...draft, polishProvider: value as PolishProvider })}
-          />
-        ) : null}
-
-        {editing === "polishEndpoint" ? (
-          <TextField
-            label="润色接口"
-            value={draft.polishEndpoint}
-            placeholder="https://api.deepseek.com/v1"
-            onChange={(value) => setDraft({ ...draft, polishEndpoint: value })}
-          />
-        ) : null}
-
-        {editing === "polishModel" ? (
-          <TextField
-            label="润色模型"
-            value={draft.polishModel}
-            placeholder="deepseek-v4-flash"
-            onChange={(value) => setDraft({ ...draft, polishModel: value })}
-          />
-        ) : null}
-
-        {editing === "polishApiKey" ? (
-          <SecretField
-            label="润色 API Key"
-            value={draft.polishApiKey}
-            hasSavedSecret={secrets.polishApiKey}
-            onChange={(value) => setDraft({ ...draft, polishApiKey: value })}
-          />
-        ) : null}
-
-        {editing === "outputMode" ? (
-          <SelectField
-            label="输出模式"
-            value={draft.outputMode}
-            options={[
-              { value: "fast_dictation", label: OUTPUT_MODE_LABEL.fast_dictation },
-              { value: "smart_polish", label: OUTPUT_MODE_LABEL.smart_polish },
-              { value: "prompt_builder", label: OUTPUT_MODE_LABEL.prompt_builder },
-              { value: "code_prompt", label: OUTPUT_MODE_LABEL.code_prompt },
-            ]}
-            onChange={(value) => setDraft({ ...draft, outputMode: value as DictationMode })}
-          />
-        ) : null}
-      </Drawer>
     </>
   );
 }
@@ -386,47 +421,6 @@ function SelectField({
       </select>
     </label>
   );
-}
-
-function editorTitle(id: EditorId | null): string {
-  switch (id) {
-    case "asrProvider":
-      return "选择 ASR 服务商";
-    case "asrModel":
-      return "ASR 模型";
-    case "asrEndpoint":
-      return "ASR 接口";
-    case "asrApiKey":
-      return "ASR API Key";
-    case "volcengine":
-      return "Volcengine 凭证";
-    case "polishProvider":
-      return "选择润色服务商";
-    case "polishModel":
-      return "润色模型";
-    case "polishEndpoint":
-      return "润色接口";
-    case "polishApiKey":
-      return "润色 API Key";
-    case "outputMode":
-      return "输出模式";
-    default:
-      return "";
-  }
-}
-
-function editorDescription(id: EditorId | null): string | undefined {
-  switch (id) {
-    case "asrApiKey":
-    case "polishApiKey":
-      return "保存后会写入 macOS Keychain，下次启动自动读取，配置文件中只保留占位。";
-    case "volcengine":
-      return "Volcengine streaming ASR 需要 App ID、Resource ID 和 Access Token 三项。";
-    case "outputMode":
-      return "决定文本经过哪条整理链路：快速听写跳过润色，智能润色调用 LLM。";
-    default:
-      return undefined;
-  }
 }
 
 function diffPatch(current: AppConfig, draft: AppConfig): Partial<AppConfig> {
