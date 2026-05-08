@@ -20,6 +20,7 @@ export const defaultConfig: AppConfig = {
   polishApiKey: "",
   polishModel: "deepseek-v4-flash",
   outputMode: "smart_polish",
+  capsuleSize: "large",
   autoInsert: true,
   hotkey: "Option+Space",
   presets: [DEFAULT_PRESET],

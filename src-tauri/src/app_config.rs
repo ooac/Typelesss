@@ -39,6 +39,8 @@ pub struct AppConfig {
     pub polish_api_key: String,
     pub polish_model: String,
     pub output_mode: String,
+    #[serde(default = "default_capsule_size")]
+    pub capsule_size: String,
     pub auto_insert: bool,
     #[serde(default = "default_hotkey")]
     pub hotkey: String,
@@ -69,6 +71,7 @@ impl Default for AppConfig {
             polish_api_key: String::new(),
             polish_model: DEFAULT_DEEPSEEK_POLISH_MODEL.to_string(),
             output_mode: "smart_polish".to_string(),
+            capsule_size: default_capsule_size(),
             auto_insert: true,
             hotkey: default_hotkey(),
             presets: vec![default_preset],
@@ -158,6 +161,10 @@ fn migrate_legacy_defaults(config: &mut AppConfig) {
 
 fn default_hotkey() -> String {
     DEFAULT_HOTKEY.to_string()
+}
+
+fn default_capsule_size() -> String {
+    "large".to_string()
 }
 
 #[cfg(test)]

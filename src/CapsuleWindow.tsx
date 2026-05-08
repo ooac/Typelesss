@@ -1,8 +1,15 @@
 import { listen } from "@tauri-apps/api/event";
+import { LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Waves } from "lucide-react";
 import { useEffect, useLayoutEffect, useState, type PointerEvent } from "react";
-import type { CapsulePayload, RuntimeState } from "./appTypes.js";
+import type { CapsulePayload, CapsuleSize, RuntimeState } from "./appTypes.js";
+
+const SIZE_MAP: Record<CapsuleSize, { width: number; height: number }> = {
+  large: { width: 360, height: 70 },
+  medium: { width: 300, height: 58 },
+  small: { width: 240, height: 46 },
+};
 
 export function CapsuleWindow() {
   const [payload, setPayload] = useState<CapsulePayload>({
@@ -10,6 +17,7 @@ export function CapsuleWindow() {
     status: "准备就绪",
     previewText: "",
     startedAt: null,
+    capsuleSize: "large",
   });
   const [now, setNow] = useState(Date.now());
 
@@ -28,7 +36,18 @@ export function CapsuleWindow() {
   }, []);
 
   useEffect(() => {
-    const unlisten = listen<CapsulePayload>("capsule-state", (event) => setPayload(event.payload));
+    const unlisten = listen<CapsulePayload>("capsule-state", (event) => {
+      const next = event.payload;
+      setPayload((prev) => {
+        if (prev.capsuleSize !== next.capsuleSize) {
+          const { width, height } = SIZE_MAP[next.capsuleSize];
+          const win = getCurrentWindow();
+          void win.setMinSize(new LogicalSize(180, 40));
+          void win.setSize(new LogicalSize(width, height));
+        }
+        return next;
+      });
+    });
     return () => {
       void unlisten.then((dispose) => dispose());
     };
@@ -44,7 +63,12 @@ export function CapsuleWindow() {
   };
 
   return (
-    <main className={`floating-capsule ${payload.state}`} data-tauri-drag-region onPointerDown={startCapsuleDrag}>
+    <main
+      className={`floating-capsule ${payload.state}`}
+      data-size={payload.capsuleSize}
+      data-tauri-drag-region
+      onPointerDown={startCapsuleDrag}
+    >
       <div className="capsule-core">
         <div className="capsule-orb" aria-hidden="true">
           <Waves size={18} />

@@ -1,6 +1,6 @@
 import { Waves } from "lucide-react";
 import { useApp } from "../state/AppContext.js";
-import type { RuntimeState } from "../appTypes.js";
+import type { CapsuleSize, RuntimeState } from "../appTypes.js";
 
 const STATE_LABEL: Record<RuntimeState, string> = {
   idle: "待命",
@@ -11,7 +11,7 @@ const STATE_LABEL: Record<RuntimeState, string> = {
 };
 
 export function InlineCapsulePreview() {
-  const { state, status, rawText, normalizedText, finalText, error, recordingElapsed, formattedHotkey } = useApp();
+  const { state, status, rawText, normalizedText, finalText, error, recordingElapsed, formattedHotkey, config, updateAndSaveConfig } = useApp();
   const previewText = error || finalText || normalizedText || rawText;
   const detail = previewText.trim()
     ? previewText.trim().slice(0, 80)
@@ -19,10 +19,31 @@ export function InlineCapsulePreview() {
       ? `${formattedHotkey} 已保存。若你刚打开输入监控权限，请重启 App 后再按。`
       : status;
 
+  const sizeOptions: { value: CapsuleSize; label: string }[] = [
+    { value: "large", label: "大" },
+    { value: "medium", label: "中" },
+    { value: "small", label: "极小" },
+  ];
+
   return (
     <section className="inline-capsule" aria-label="胶囊预览">
-      <span className="inline-capsule__kicker">胶囊预览</span>
-      <div className={`inline-capsule__body ${state}`}>
+      <div className="inline-capsule__header">
+        <span className="inline-capsule__kicker">胶囊预览</span>
+        <div className="size-segmented" role="group" aria-label="胶囊尺寸">
+          {sizeOptions.map((opt) => (
+            <button
+              key={opt.value}
+              type="button"
+              className={config.capsuleSize === opt.value ? "is-active" : ""}
+              onClick={() => void updateAndSaveConfig({ capsuleSize: opt.value })}
+              aria-pressed={config.capsuleSize === opt.value}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className={`inline-capsule__body ${state}`} data-size={config.capsuleSize}>
         <div className="capsule-orb" aria-hidden="true">
           <Waves size={20} />
         </div>

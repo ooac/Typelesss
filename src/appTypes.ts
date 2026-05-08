@@ -1,6 +1,7 @@
 import type { DictationMode } from "./types.js";
 
 export type RuntimeState = "idle" | "recording" | "processing" | "inserted" | "error";
+export type CapsuleSize = "large" | "medium" | "small";
 export type AsrProvider = "whisper_compatible" | "volcengine";
 export type PolishProvider = "openai_compatible" | "disabled";
 
@@ -24,6 +25,7 @@ export interface AppConfig {
   polishApiKey: string;
   polishModel: string;
   outputMode: DictationMode;
+  capsuleSize: CapsuleSize;
   autoInsert: boolean;
   hotkey: string;
   presets: Preset[];
@@ -50,4 +52,5 @@ export interface CapsulePayload {
   status: string;
   previewText: string;
   startedAt: number | null;
+  capsuleSize: CapsuleSize;
 }

@@ -169,9 +169,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
         status,
         previewText,
         startedAt: recordingStartedAt,
+        capsuleSize: config.capsuleSize,
       } satisfies CapsulePayload,
     });
-  }, [isTauriRuntime, state, status, rawText, normalizedText, finalText, error, recordingStartedAt]);
+  }, [isTauriRuntime, state, status, rawText, normalizedText, finalText, error, recordingStartedAt, config.capsuleSize]);
 
   const saveConfig = useCallback(async () => {
     if (!isTauriRuntime) {
