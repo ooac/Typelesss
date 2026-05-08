@@ -24,10 +24,12 @@ export function ProviderRow({ icon, label, value, status, onClick, disabled }: P
         <span className="provider-row__label">{label}</span>
         <span className="provider-row__value">{value}</span>
       </div>
-      {status ? <div className="provider-row__status">{status}</div> : null}
-      {interactive ? (
-        <ChevronRight size={18} className="provider-row__chevron" aria-hidden="true" />
-      ) : null}
+      <div className="provider-row__tail">
+        {status ? <div className="provider-row__status">{status}</div> : null}
+        {interactive ? (
+          <ChevronRight size={18} className="provider-row__chevron" aria-hidden="true" />
+        ) : null}
+      </div>
     </button>
   );
 }

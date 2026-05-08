@@ -20,7 +20,7 @@ export function PermissionsPage() {
   } = useApp();
 
   const [perms, setPerms] = useState<PermissionStatus>(DEFAULT_STATUS);
-  const [micTestResult, setMicTestResult] = useState<string>("尚未测试");
+  const [micTestResult, setMicTestResult] = useState<string>("");
   const [testing, setTesting] = useState(false);
 
   const refresh = useCallback(async () => {
@@ -87,7 +87,7 @@ export function PermissionsPage() {
           title="麦克风"
           description="用于录音并发送给 ASR 服务转写。首次录音 macOS 会主动请求授权。"
           status={perms.microphone}
-          detail={micTestResult}
+          detail={micTestResult || undefined}
           actions={
             <button
               type="button"

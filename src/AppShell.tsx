@@ -38,7 +38,6 @@ export function AppShell() {
   return (
     <main className="shell">
       <aside className="app-rail" aria-label="主导航">
-        <div className="rail-mark">T</div>
         {RAIL_ITEMS.map((item) => (
           <button
             key={item.id}
