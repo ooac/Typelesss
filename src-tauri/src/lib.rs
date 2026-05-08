@@ -1,26 +1,37 @@
 mod app_config;
+mod health;
 mod insertion;
 mod modifier_hotkey;
+mod permissions;
 mod providers;
 mod recorder;
 mod secret_store;
 
-use app_config::{load_config_from_disk, save_config_to_disk, AppConfig};
+use app_config::{load_config_from_disk, save_config_to_disk, AppConfig, Preset};
 use insertion::InsertTarget;
 use modifier_hotkey::{ModifierHotkeyState, RIGHT_OPTION_HOTKEY};
 use recorder::{Recorder, RecordingResult};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Command;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+use tauri_plugin_sql::{Migration, MigrationKind};
 
 struct AppState {
     recorder: Mutex<Recorder>,
     insert_target: Mutex<Option<InsertTarget>>,
+    /// Single string flag used by `modifier_hotkey` to decide whether the right-Option
+    /// monitor should fire — set to `"RightOption"` when any preset uses it.
     hotkey: Arc<Mutex<String>>,
     modifier_hotkey: ModifierHotkeyState,
+    /// All currently-registered (hotkey-string, parsed Shortcut) pairs, used to
+    /// resolve which preset fired in the global-shortcut handler and to unregister
+    /// cleanly when presets change.
+    shortcut_registry: Arc<Mutex<Vec<(String, Shortcut)>>>,
 }
 
 #[tauri::command]
@@ -34,10 +45,10 @@ fn save_config(
     state: tauri::State<AppState>,
     mut config: AppConfig,
 ) -> Result<String, String> {
-    let hotkey = register_hotkey(&app, &state, &config.hotkey)?;
-    config.hotkey = hotkey.clone();
+    sync_legacy_hotkey(&mut config);
+    register_presets(&app, &state, &config.presets)?;
     save_config_to_disk(&config).map_err(|err| err.to_string())?;
-    Ok(hotkey)
+    Ok(config.hotkey.clone())
 }
 
 #[tauri::command]
@@ -98,6 +109,31 @@ async fn polish_text(config: AppConfig, text: String, mode: String) -> Result<St
     providers::polish_text(&config, &text, &mode)
         .await
         .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn probe_asr_endpoint(config: AppConfig) -> Result<health::ProbeResult, String> {
+    Ok(health::probe_asr(&config).await)
+}
+
+#[tauri::command]
+async fn probe_polish_endpoint(config: AppConfig) -> Result<health::ProbeResult, String> {
+    Ok(health::probe_polish(&config).await)
+}
+
+#[tauri::command]
+fn check_secret_status() -> health::SecretStatus {
+    health::secret_status()
+}
+
+#[tauri::command]
+fn check_permissions() -> permissions::PermissionStatus {
+    permissions::check_all()
+}
+
+#[tauri::command]
+fn test_microphone() -> Result<f32, String> {
+    permissions::test_microphone()
 }
 
 #[tauri::command]
@@ -211,51 +247,112 @@ fn open_system_settings(url: &str, fallback_message: &str) -> Result<(), String>
         })
 }
 
-fn register_hotkey(app: &AppHandle, state: &AppState, hotkey: &str) -> Result<String, String> {
-    let hotkey = normalize_hotkey(hotkey)?;
-    let mut current = state
-        .hotkey
-        .lock()
-        .map_err(|_| "快捷键状态锁定失败".to_string())?;
-    if *current == hotkey {
-        return Ok(hotkey);
+/// Mirror the active preset's hotkey into the legacy `config.hotkey` field
+/// (keeps backward-compat for any code that still reads it).
+fn sync_legacy_hotkey(config: &mut AppConfig) {
+    if let Some(active) = config
+        .presets
+        .iter()
+        .find(|p| p.id == config.active_preset_id)
+    {
+        config.hotkey = active.hotkey.clone();
+        config.output_mode = active.output_mode.clone();
+    }
+}
+
+/// Re-register all preset hotkeys.  Unregisters previous shortcuts first,
+/// then attempts each new one; failed registrations are logged but don't
+/// abort the rest.  Right-Option is handled via the modifier monitor.
+fn register_presets(
+    app: &AppHandle,
+    state: &AppState,
+    presets: &[Preset],
+) -> Result<Vec<String>, String> {
+    let normalized: Vec<(String, String)> = presets
+        .iter()
+        .map(|p| {
+            let hk = normalize_hotkey(&p.hotkey)?;
+            Ok::<_, String>((p.id.clone(), hk))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut seen: HashSet<String> = HashSet::new();
+    for (_, hk) in &normalized {
+        if !seen.insert(hk.clone()) {
+            return Err(format!("快捷键 {hk} 被多个预设占用，请改一个。"));
+        }
     }
 
-    let previous = current.clone();
+    {
+        let mut registry = state
+            .shortcut_registry
+            .lock()
+            .map_err(|_| "快捷键状态锁定失败".to_string())?;
+        for (hk, _) in registry.iter() {
+            if hk != RIGHT_OPTION_HOTKEY {
+                let _ = app.global_shortcut().unregister(hk.as_str());
+            }
+        }
+        registry.clear();
+    }
 
-    if hotkey == RIGHT_OPTION_HOTKEY {
+    let right_option_used = normalized
+        .iter()
+        .any(|(_, hk)| hk == RIGHT_OPTION_HOTKEY);
+    {
+        let mut current = state
+            .hotkey
+            .lock()
+            .map_err(|_| "快捷键状态锁定失败".to_string())?;
+        *current = if right_option_used {
+            RIGHT_OPTION_HOTKEY.to_string()
+        } else {
+            String::new()
+        };
+    }
+    if right_option_used {
         if let Err(err) = state
             .modifier_hotkey
             .ensure_right_option_monitor(app.clone())
         {
             eprintln!("Right Option saved but not active yet: {err}");
             let _ = open_input_monitoring_settings();
-            *current = hotkey.clone();
-            return Ok(hotkey);
         }
-        if !previous.is_empty() && previous != RIGHT_OPTION_HOTKEY {
-            let _ = app.global_shortcut().unregister(previous.as_str());
-        }
-        *current = hotkey.clone();
-        return Ok(hotkey);
     }
 
-    if !previous.is_empty() && previous != RIGHT_OPTION_HOTKEY {
-        let _ = app.global_shortcut().unregister(previous.as_str());
-    }
-
-    match app.global_shortcut().register(hotkey.as_str()) {
-        Ok(()) => {
-            *current = hotkey.clone();
-            Ok(hotkey)
+    let mut registered_strings: Vec<String> = Vec::with_capacity(normalized.len());
+    let mut registry_entries: Vec<(String, Shortcut)> = Vec::with_capacity(normalized.len());
+    for (_id, hk) in &normalized {
+        if hk == RIGHT_OPTION_HOTKEY {
+            registered_strings.push(hk.clone());
+            continue;
         }
-        Err(err) => {
-            if !previous.is_empty() && previous != RIGHT_OPTION_HOTKEY {
-                let _ = app.global_shortcut().register(previous.as_str());
+        let parsed = match Shortcut::from_str(hk.as_str()) {
+            Ok(sc) => sc,
+            Err(err) => {
+                eprintln!("Invalid hotkey {hk}: {err}");
+                continue;
             }
-            Err(format!("快捷键注册失败：{err}"))
+        };
+        match app.global_shortcut().register(hk.as_str()) {
+            Ok(()) => {
+                registered_strings.push(hk.clone());
+                registry_entries.push((hk.clone(), parsed));
+            }
+            Err(err) => {
+                eprintln!("Failed to register {hk}: {err}");
+            }
         }
     }
+    {
+        let mut registry = state
+            .shortcut_registry
+            .lock()
+            .map_err(|_| "快捷键状态锁定失败".to_string())?;
+        *registry = registry_entries;
+    }
+
+    Ok(registered_strings)
 }
 
 fn normalize_hotkey(hotkey: &str) -> Result<String, String> {
@@ -331,43 +428,100 @@ mod tests {
 }
 
 pub fn run() {
+    let active_hotkey: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let shortcut_registry: Arc<Mutex<Vec<(String, Shortcut)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let handler_registry = Arc::clone(&shortcut_registry);
     let global_shortcut_plugin = tauri_plugin_global_shortcut::Builder::new()
-        .with_handler(|app, _shortcut, event| {
+        .with_handler(move |app, shortcut, event| {
             if event.state() == ShortcutState::Pressed {
-                let _ = app.emit("global-shortcut-toggle", ());
+                let matched = handler_registry
+                    .lock()
+                    .ok()
+                    .and_then(|reg| {
+                        reg.iter()
+                            .find(|(_, sc)| sc == shortcut)
+                            .map(|(s, _)| s.clone())
+                    })
+                    .unwrap_or_else(|| shortcut.to_string());
+                let payload = serde_json::json!({ "shortcut": matched });
+                let _ = app.emit("global-shortcut-toggle", payload);
             }
         })
         .build();
 
-    let active_hotkey = Arc::new(Mutex::new(String::new()));
+    let history_migrations = vec![Migration {
+        version: 1,
+        description: "create dictation_sessions and correction_pairs tables",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS dictation_sessions (
+                id TEXT PRIMARY KEY,
+                started_at INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                raw_text TEXT NOT NULL DEFAULT '',
+                normalized_text TEXT NOT NULL DEFAULT '',
+                final_text TEXT NOT NULL DEFAULT '',
+                output_mode TEXT NOT NULL DEFAULT '',
+                asr_provider TEXT NOT NULL DEFAULT '',
+                polish_provider TEXT NOT NULL DEFAULT '',
+                target_app TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_started_at
+                ON dictation_sessions (started_at DESC);
+            CREATE TABLE IF NOT EXISTS correction_pairs (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                before_text TEXT NOT NULL,
+                after_text TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'auto',
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES dictation_sessions(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_corrections_session_id
+                ON correction_pairs (session_id);
+        "#,
+        kind: MigrationKind::Up,
+    }];
 
     tauri::Builder::default()
         .plugin(global_shortcut_plugin)
+        .plugin(
+            tauri_plugin_sql::Builder::default()
+                .add_migrations("sqlite:typelesss-history.db", history_migrations)
+                .build(),
+        )
         .manage(AppState {
             recorder: Mutex::new(Recorder::default()),
             insert_target: Mutex::new(None),
             hotkey: Arc::clone(&active_hotkey),
             modifier_hotkey: ModifierHotkeyState::new(active_hotkey),
+            shortcut_registry,
         })
         .setup(|app| {
             let _ = app.path().app_config_dir();
             let mut config = load_config_from_disk().unwrap_or_default();
-            if let Err(err) = register_hotkey(
+            sync_legacy_hotkey(&mut config);
+            if let Err(err) = register_presets(
                 app.handle(),
                 app.state::<AppState>().inner(),
-                &config.hotkey,
+                &config.presets,
             ) {
-                eprintln!("failed to register configured hotkey: {err}");
-                if register_hotkey(
+                eprintln!("failed to register configured presets: {err}");
+                let fallback = Preset {
+                    id: "default".to_string(),
+                    label: "默认".to_string(),
+                    hotkey: "Control+Option+Space".to_string(),
+                    output_mode: config.output_mode.clone(),
+                };
+                config.presets = vec![fallback.clone()];
+                config.active_preset_id = fallback.id.clone();
+                config.hotkey = fallback.hotkey.clone();
+                let _ = register_presets(
                     app.handle(),
                     app.state::<AppState>().inner(),
-                    "Control+Option+Space",
-                )
-                .is_ok()
-                {
-                    config.hotkey = "Control+Option+Space".to_string();
-                    let _ = save_config_to_disk(&config);
-                }
+                    &config.presets,
+                );
+                let _ = save_config_to_disk(&config);
             }
             if !insertion::has_accessibility_permission() {
                 let _ = insertion::request_accessibility_permission();
@@ -387,7 +541,12 @@ pub fn run() {
             update_capsule,
             open_input_monitoring_settings,
             open_accessibility_settings,
-            install_to_applications_and_open_input_monitoring
+            install_to_applications_and_open_input_monitoring,
+            probe_asr_endpoint,
+            probe_polish_endpoint,
+            check_secret_status,
+            check_permissions,
+            test_microphone
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Tauri app");

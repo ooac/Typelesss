@@ -13,6 +13,16 @@ const DEFAULT_SILICONFLOW_ASR_MODEL: &str = "FunAudioLLM/SenseVoiceSmall";
 const DEFAULT_DEEPSEEK_POLISH_ENDPOINT: &str = "https://api.deepseek.com/v1";
 const DEFAULT_DEEPSEEK_POLISH_MODEL: &str = "deepseek-v4-flash";
 const DEFAULT_HOTKEY: &str = "Option+Space";
+const DEFAULT_PRESET_ID: &str = "default";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Preset {
+    pub id: String,
+    pub label: String,
+    pub hotkey: String,
+    pub output_mode: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,10 +42,20 @@ pub struct AppConfig {
     pub auto_insert: bool,
     #[serde(default = "default_hotkey")]
     pub hotkey: String,
+    #[serde(default)]
+    pub presets: Vec<Preset>,
+    #[serde(default)]
+    pub active_preset_id: String,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
+        let default_preset = Preset {
+            id: DEFAULT_PRESET_ID.to_string(),
+            label: "默认".to_string(),
+            hotkey: DEFAULT_HOTKEY.to_string(),
+            output_mode: "smart_polish".to_string(),
+        };
         Self {
             asr_provider: "whisper_compatible".to_string(),
             asr_endpoint: DEFAULT_SILICONFLOW_ASR_ENDPOINT.to_string(),
@@ -51,6 +71,8 @@ impl Default for AppConfig {
             output_mode: "smart_polish".to_string(),
             auto_insert: true,
             hotkey: default_hotkey(),
+            presets: vec![default_preset],
+            active_preset_id: DEFAULT_PRESET_ID.to_string(),
         }
     }
 }
@@ -113,6 +135,24 @@ fn migrate_legacy_defaults(config: &mut AppConfig) {
     }
     if config.polish_model.trim() == LEGACY_OPENAI_POLISH_MODEL {
         config.polish_model = DEFAULT_DEEPSEEK_POLISH_MODEL.to_string();
+    }
+
+    // Build a default preset from legacy hotkey/output_mode if presets are missing.
+    if config.presets.is_empty() {
+        config.presets.push(Preset {
+            id: DEFAULT_PRESET_ID.to_string(),
+            label: "默认".to_string(),
+            hotkey: config.hotkey.clone(),
+            output_mode: config.output_mode.clone(),
+        });
+    }
+    if config.active_preset_id.is_empty()
+        || !config
+            .presets
+            .iter()
+            .any(|p| p.id == config.active_preset_id)
+    {
+        config.active_preset_id = config.presets[0].id.clone();
     }
 }
 
@@ -183,5 +223,33 @@ mod tests {
         .expect("older config should deserialize");
 
         assert_eq!(config.hotkey, DEFAULT_HOTKEY);
+    }
+
+    #[test]
+    fn migrates_legacy_config_to_default_preset() {
+        let mut config: AppConfig = serde_json::from_value(serde_json::json!({
+            "asrProvider": "whisper_compatible",
+            "asrEndpoint": DEFAULT_SILICONFLOW_ASR_ENDPOINT,
+            "asrApiKey": "",
+            "asrModel": DEFAULT_SILICONFLOW_ASR_MODEL,
+            "volcengineAppId": "",
+            "volcengineAccessToken": "",
+            "volcengineResourceId": "",
+            "polishProvider": "openai_compatible",
+            "polishEndpoint": DEFAULT_DEEPSEEK_POLISH_ENDPOINT,
+            "polishApiKey": "",
+            "polishModel": DEFAULT_DEEPSEEK_POLISH_MODEL,
+            "outputMode": "smart_polish",
+            "autoInsert": true,
+            "hotkey": "Control+Option+D"
+        }))
+        .expect("legacy config should deserialize");
+
+        migrate_legacy_defaults(&mut config);
+
+        assert_eq!(config.presets.len(), 1);
+        assert_eq!(config.presets[0].hotkey, "Control+Option+D");
+        assert_eq!(config.presets[0].output_mode, "smart_polish");
+        assert_eq!(config.active_preset_id, DEFAULT_PRESET_ID);
     }
 }

@@ -57,14 +57,14 @@ export function SettingsForm({
   return (
     <div className="settings-form">
       <label>
-        ASR Provider
+        ASR 服务商
         <select value={config.asrProvider} onChange={(event) => update("asrProvider", event.target.value as AsrProvider)}>
           <option value="whisper_compatible">硅基流动 / Whisper-compatible</option>
           <option value="volcengine">Volcengine streaming（配置预留）</option>
         </select>
       </label>
       <label>
-        ASR Endpoint
+        ASR 接口
         <input value={config.asrEndpoint} onChange={(event) => update("asrEndpoint", event.target.value)} />
       </label>
       <label>
@@ -72,19 +72,19 @@ export function SettingsForm({
         <input type="password" value={config.asrApiKey} onChange={(event) => update("asrApiKey", event.target.value)} />
       </label>
       <label>
-        ASR Model
+        ASR 模型
         <input value={config.asrModel} onChange={(event) => update("asrModel", event.target.value)} />
       </label>
       <label>
-        Volcengine App ID
+        Volcengine 应用 ID
         <input value={config.volcengineAppId} onChange={(event) => update("volcengineAppId", event.target.value)} />
       </label>
       <label>
-        Volcengine Resource ID
+        Volcengine 资源 ID
         <input value={config.volcengineResourceId} onChange={(event) => update("volcengineResourceId", event.target.value)} />
       </label>
       <label>
-        Volcengine Access Token
+        Volcengine 访问令牌
         <input
           type="password"
           value={config.volcengineAccessToken}
@@ -92,31 +92,31 @@ export function SettingsForm({
         />
       </label>
       <label>
-        Polish Provider
+        润色服务商
         <select value={config.polishProvider} onChange={(event) => update("polishProvider", event.target.value as PolishProvider)}>
           <option value="openai_compatible">DeepSeek / OpenAI-compatible</option>
-          <option value="disabled">禁用 polish</option>
+          <option value="disabled">禁用润色</option>
         </select>
       </label>
       <label>
-        Polish Endpoint
+        润色接口
         <input value={config.polishEndpoint} onChange={(event) => update("polishEndpoint", event.target.value)} />
       </label>
       <label>
-        Polish API Key
+        润色 API Key
         <input type="password" value={config.polishApiKey} onChange={(event) => update("polishApiKey", event.target.value)} />
       </label>
       <label>
-        Polish Model
+        润色模型
         <input value={config.polishModel} onChange={(event) => update("polishModel", event.target.value)} />
       </label>
       <label>
         输出模式
         <select value={config.outputMode} onChange={(event) => update("outputMode", event.target.value as DictationMode)}>
-          <option value="fast_dictation">Fast Dictation</option>
-          <option value="smart_polish">Smart Polish</option>
-          <option value="prompt_builder">Prompt Builder</option>
-          <option value="code_prompt">Code Prompt</option>
+          <option value="fast_dictation">快速听写</option>
+          <option value="smart_polish">智能润色</option>
+          <option value="prompt_builder">提示词构建</option>
+          <option value="code_prompt">代码提示词</option>
         </select>
       </label>
       <label>
