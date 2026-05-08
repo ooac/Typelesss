@@ -64,8 +64,7 @@ export function CapsuleWindow() {
 
   return (
     <main
-      className={`floating-capsule ${payload.state}`}
-      data-size={payload.capsuleSize}
+      className={`floating-capsule floating-capsule--${payload.capsuleSize} ${payload.state}`}
       data-tauri-drag-region
       onPointerDown={startCapsuleDrag}
     >

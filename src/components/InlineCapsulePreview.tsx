@@ -43,7 +43,7 @@ export function InlineCapsulePreview() {
           ))}
         </div>
       </div>
-      <div className={`inline-capsule__body ${state}`} data-size={config.capsuleSize}>
+      <div className={`inline-capsule__body inline-capsule__body--${config.capsuleSize} ${state}`}>
         <div className="capsule-orb" aria-hidden="true">
           <Waves size={20} />
         </div>

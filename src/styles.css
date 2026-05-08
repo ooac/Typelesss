@@ -862,56 +862,64 @@ button:disabled {
     inset 0 0 0 1px var(--line-accent);
 }
 
-/* medium — 精简信息 */
-.inline-capsule__body[data-size="medium"] {
-  grid-template-columns: 40px minmax(0, 1fr) auto;
-  height: 52px;
+/* medium — 整体缩小，布局不变 */
+.inline-capsule__body--medium {
+  grid-template-columns: 44px minmax(0, 1fr) auto;
+  height: 48px;
+  padding: 0 12px;
+  gap: 8px;
 }
-.inline-capsule__body[data-size="medium"] .capsule-orb {
-  width: 36px;
-  height: 36px;
+.inline-capsule__body--medium .capsule-orb {
+  width: 32px;
+  height: 32px;
 }
-.inline-capsule__body[data-size="medium"] .capsule-copy strong {
-  font-size: var(--fs-md);
-}
-.inline-capsule__body[data-size="medium"] .capsule-meter {
-  gap: 2px;
-}
-.inline-capsule__body[data-size="medium"] .capsule-meter span {
-  width: 2px;
-  height: 10px;
-}
-
-/* small — 极简单行 */
-.inline-capsule__body[data-size="small"] {
-  grid-template-columns: 32px minmax(0, 1fr) auto;
-  height: 40px;
-  gap: var(--s2);
-}
-.inline-capsule__body[data-size="small"] .capsule-orb {
-  width: 28px;
-  height: 28px;
-}
-.inline-capsule__body[data-size="small"] .capsule-orb svg {
+.inline-capsule__body--medium .capsule-orb svg {
   width: 14px;
   height: 14px;
 }
-.inline-capsule__body[data-size="small"] .capsule-copy {
-  flex-direction: row;
-  align-items: center;
-  gap: 4px;
+.inline-capsule__body--medium .capsule-copy strong {
+  font-size: 13px;
 }
-.inline-capsule__body[data-size="small"] .capsule-copy strong {
-  font-size: var(--fs-sm);
-  flex-shrink: 0;
+.inline-capsule__body--medium .capsule-copy p {
+  font-size: 11px;
 }
-.inline-capsule__body[data-size="small"] .capsule-copy p {
-  font-size: var(--fs-xs);
-  display: inline;
-  color: var(--muted);
+.inline-capsule__body--medium .capsule-meter {
+  gap: 2px;
+  height: 18px;
 }
-.inline-capsule__body[data-size="small"] .capsule-meter {
-  display: none;
+.inline-capsule__body--medium .capsule-meter span {
+  width: 2px;
+  height: 8px;
+}
+
+/* small — 整体缩小，布局不变 */
+.inline-capsule__body--small {
+  grid-template-columns: 36px minmax(0, 1fr) auto;
+  height: 34px;
+  padding: 0 10px;
+  gap: 6px;
+}
+.inline-capsule__body--small .capsule-orb {
+  width: 24px;
+  height: 24px;
+}
+.inline-capsule__body--small .capsule-orb svg {
+  width: 12px;
+  height: 12px;
+}
+.inline-capsule__body--small .capsule-copy strong {
+  font-size: 11px;
+}
+.inline-capsule__body--small .capsule-copy p {
+  font-size: 10px;
+}
+.inline-capsule__body--small .capsule-meter {
+  gap: 1px;
+  height: 14px;
+}
+.inline-capsule__body--small .capsule-meter span {
+  width: 2px;
+  height: 6px;
 }
 
 .capsule-orb {
@@ -1883,67 +1891,74 @@ button:disabled {
     inset 0 0 0 1px var(--line-accent);
 }
 
-/* medium — 精简信息 */
-.floating-capsule[data-size="medium"] .capsule-core {
-  grid-template-columns: 34px minmax(0, 1fr) 28px;
+/* medium — 整体缩小，布局不变 */
+.floating-capsule--medium .capsule-core {
+  grid-template-columns: 32px minmax(0, 1fr) 26px;
   padding: 6px 10px 6px 6px;
+  gap: 8px;
 }
-.floating-capsule[data-size="medium"] .capsule-orb {
-  width: 30px;
-  height: 30px;
+.floating-capsule--medium .capsule-orb {
+  width: 28px;
+  height: 28px;
 }
-.floating-capsule[data-size="medium"] .capsule-orb svg {
+.floating-capsule--medium .capsule-orb svg {
   width: 14px;
   height: 14px;
 }
-.floating-capsule[data-size="medium"] .capsule-topline {
+.floating-capsule--medium .capsule-topline {
   margin-bottom: 1px;
 }
-.floating-capsule[data-size="medium"] .capsule-topline span {
-  font-size: var(--fs-sm);
+.floating-capsule--medium .capsule-topline span {
+  font-size: 13px;
 }
-.floating-capsule[data-size="medium"] .capsule-topline strong {
-  font-size: var(--fs-xs);
+.floating-capsule--medium .capsule-topline strong {
+  font-size: 11px;
 }
-.floating-capsule[data-size="medium"] p {
-  font-size: var(--fs-xs);
+.floating-capsule--medium p {
+  font-size: 11px;
 }
-.floating-capsule[data-size="medium"] .capsule-meter {
+.floating-capsule--medium .capsule-meter {
   gap: 2px;
+  height: 18px;
 }
-.floating-capsule[data-size="medium"] .capsule-meter span {
+.floating-capsule--medium .capsule-meter span {
   width: 2px;
-  height: 10px;
+  height: 8px;
 }
 
-/* small — 极简单行 */
-.floating-capsule[data-size="small"] .capsule-core {
-  grid-template-columns: 28px minmax(0, 1fr) 22px;
-  padding: 5px 8px 5px 5px;
-  gap: var(--s2);
+/* small — 整体缩小，布局不变 */
+.floating-capsule--small .capsule-core {
+  grid-template-columns: 24px minmax(0, 1fr) 20px;
+  padding: 4px 8px 4px 4px;
+  gap: 6px;
 }
-.floating-capsule[data-size="small"] .capsule-orb {
-  width: 24px;
-  height: 24px;
+.floating-capsule--small .capsule-orb {
+  width: 22px;
+  height: 22px;
 }
-.floating-capsule[data-size="small"] .capsule-orb svg {
-  width: 12px;
-  height: 12px;
+.floating-capsule--small .capsule-orb svg {
+  width: 11px;
+  height: 11px;
 }
-.floating-capsule[data-size="small"] .capsule-topline {
+.floating-capsule--small .capsule-topline {
   margin-bottom: 0;
 }
-.floating-capsule[data-size="small"] .capsule-topline span {
-  font-size: var(--fs-xs);
+.floating-capsule--small .capsule-topline span {
+  font-size: 11px;
 }
-.floating-capsule[data-size="small"] .capsule-topline strong {
-  font-size: var(--fs-xs);
+.floating-capsule--small .capsule-topline strong {
+  font-size: 10px;
 }
-.floating-capsule[data-size="small"] p {
-  display: none;
+.floating-capsule--small p {
+  font-size: 10px;
 }
-.floating-capsule[data-size="small"] .capsule-meter {
-  display: none;
+.floating-capsule--small .capsule-meter {
+  gap: 1px;
+  height: 14px;
+}
+.floating-capsule--small .capsule-meter span {
+  width: 2px;
+  height: 6px;
 }
 
 .capsule-topline {
