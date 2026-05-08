@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Activity, Clock3, ShieldCheck, Sparkles, Target } from "lucide-react";
+import { Activity, ClipboardPaste, Clock3, Focus, ShieldCheck } from "lucide-react";
 import { useHealth } from "../health/HealthContext.js";
 import { navigate } from "../router.js";
 import { useApp } from "../state/AppContext.js";
@@ -58,7 +58,7 @@ export function BottomStrip() {
         </button>
       </div>
       <div className="bottom-strip__cell">
-        <Target size={14} />
+        <Focus size={14} />
         <span>当前插入目标：未检测到活动应用</span>
       </div>
       <div className="bottom-strip__cell tabular">
@@ -70,7 +70,7 @@ export function BottomStrip() {
         <span>录音时长：{recordingElapsed}</span>
       </div>
       <div className="bottom-strip__cell">
-        <Sparkles size={14} />
+        <ClipboardPaste size={14} />
         <span>{config.autoInsert ? "自动粘贴" : "复制到剪贴板"}</span>
       </div>
       <div className={`bottom-strip__ready ${ready ? "is-ready" : "is-busy"}`}>

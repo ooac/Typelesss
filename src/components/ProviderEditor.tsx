@@ -5,8 +5,7 @@ import {
   Key,
   Link2,
   RefreshCcw,
-  Sparkles,
-  Wand2,
+  AudioLines,
   Wrench,
 } from "lucide-react";
 import { useCallback, useState, type FocusEvent } from "react";
@@ -294,7 +293,7 @@ export function ProviderEditor({
 
       <div className="section-label">润色 · LLM</div>
       <ProviderRow
-        icon={<Wand2 size={16} />}
+        icon={<CloudCog size={16} />}
         label="润色服务商"
         value={POLISH_PROVIDER_LABEL[config.polishProvider] ?? config.polishProvider}
         expanded={editing === "polishProvider"}
@@ -336,7 +335,7 @@ export function ProviderEditor({
 
       <div className="section-label">输出</div>
       <ProviderRow
-        icon={<Sparkles size={16} />}
+        icon={<AudioLines size={16} />}
         label="输出模式"
         value={OUTPUT_MODE_LABEL[config.outputMode] ?? config.outputMode}
         expanded={editing === "outputMode"}

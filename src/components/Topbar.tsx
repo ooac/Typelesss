@@ -5,7 +5,6 @@ import {
   MicOff,
   Radio,
   Settings,
-  Waves,
 } from "lucide-react";
 import { navigate } from "../router.js";
 import { useApp } from "../state/AppContext.js";
@@ -15,9 +14,6 @@ export function Topbar() {
   return (
     <header className="topbar">
       <div className="brand">
-        <span className="brand-orb">
-          <Waves size={18} />
-        </span>
         <div>
           <strong>Typelesss</strong>
           <span>实时语音输入助手</span>
