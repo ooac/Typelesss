@@ -1,14 +1,11 @@
-import { Waves } from "lucide-react";
 import { useApp } from "../state/AppContext.js";
-import type { CapsuleSize, RuntimeState } from "../appTypes.js";
-
-const STATE_LABEL: Record<RuntimeState, string> = {
-  idle: "待命",
-  recording: "正在录音",
-  processing: "整理中",
-  inserted: "已插入",
-  error: "出错",
-};
+import type { CapsuleSize } from "../appTypes.js";
+import {
+  CapsuleActivityMeter,
+  CapsuleStateIcon,
+  capsuleStateLabel,
+  getCapsuleDisplaySize,
+} from "./CapsuleVisuals.js";
 
 export function InlineCapsulePreview() {
   const { state, status, rawText, normalizedText, finalText, error, recordingElapsed, formattedHotkey, config, updateAndSaveConfig } = useApp();
@@ -18,6 +15,7 @@ export function InlineCapsulePreview() {
     : state === "idle"
       ? `${formattedHotkey} 已保存。若你刚打开输入监控权限，请重启 App 后再按。`
       : status;
+  const displaySize = getCapsuleDisplaySize(config.capsuleSize, state);
 
   const sizeOptions: { value: CapsuleSize; label: string }[] = [
     { value: "large", label: "大" },
@@ -43,23 +41,20 @@ export function InlineCapsulePreview() {
           ))}
         </div>
       </div>
-      <div className={`inline-capsule__body inline-capsule__body--${config.capsuleSize} ${state}`}>
+      <div
+        className={`inline-capsule__body inline-capsule__body--${displaySize} inline-capsule__body--configured-${config.capsuleSize} ${state}`}
+      >
         <div className="capsule-orb" aria-hidden="true">
-          <Waves size={20} />
+          <CapsuleStateIcon state={state} />
         </div>
         <div className="capsule-copy">
           <strong>
-            {STATE_LABEL[state]}
+            {capsuleStateLabel(state)}
             {state === "recording" ? ` · ${recordingElapsed}` : ""}
           </strong>
           <p>{detail}</p>
         </div>
-        <div className="capsule-meter" aria-hidden="true">
-          <span />
-          <span />
-          <span />
-          <span />
-        </div>
+        <CapsuleActivityMeter state={state} />
       </div>
     </section>
   );

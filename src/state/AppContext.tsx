@@ -422,6 +422,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const unlistenToggle = listen<ShortcutTogglePayload>("global-shortcut-toggle", (event) => {
       triggerForShortcut(event.payload?.shortcut);
     });
+    const unlistenCapsuleToggle = listen("capsule-toggle-request", () => {
+      triggerForShortcut(undefined);
+    });
     const unlistenPressed = listen("global-shortcut-pressed", () => {
       // RightOption press path — match preset by RightOption hotkey
       triggerStartForShortcut("RightOption");
@@ -434,6 +437,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     });
     return () => {
       void unlistenToggle.then((dispose) => dispose());
+      void unlistenCapsuleToggle.then((dispose) => dispose());
       void unlistenPressed.then((dispose) => dispose());
       void unlistenReleased.then((dispose) => dispose());
     };

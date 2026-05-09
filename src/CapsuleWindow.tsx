@@ -1,17 +1,27 @@
-import { listen } from "@tauri-apps/api/event";
 import { LogicalSize } from "@tauri-apps/api/dpi";
+import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Waves } from "lucide-react";
-import { useEffect, useLayoutEffect, useState, type PointerEvent } from "react";
-import type { CapsulePayload, CapsuleSize, RuntimeState } from "./appTypes.js";
+import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
+import type { CapsulePayload, CapsuleSize } from "./appTypes.js";
+import {
+  CapsuleActivityMeter,
+  CapsuleStateIcon,
+  capsuleStateLabel,
+  getCapsuleDisplaySize,
+} from "./components/CapsuleVisuals.js";
 
 const SIZE_MAP: Record<CapsuleSize, { width: number; height: number }> = {
-  large: { width: 360, height: 70 },
-  medium: { width: 300, height: 58 },
-  small: { width: 240, height: 46 },
+  large: { width: 320, height: 64 },
+  medium: { width: 230, height: 52 },
+  small: { width: 44, height: 44 },
 };
 
 export function CapsuleWindow() {
+  const isTauriRuntime =
+    typeof window !== "undefined" &&
+    typeof (window as { __TAURI_INTERNALS__?: { transformCallback?: unknown } }).__TAURI_INTERNALS__
+      ?.transformCallback === "function";
+  const pointerStartRef = useRef<{ x: number; y: number } | null>(null);
   const [payload, setPayload] = useState<CapsulePayload>({
     state: "idle",
     status: "准备就绪",
@@ -36,55 +46,82 @@ export function CapsuleWindow() {
   }, []);
 
   useEffect(() => {
+    if (!isTauriRuntime) return undefined;
     const unlisten = listen<CapsulePayload>("capsule-state", (event) => {
-      const next = event.payload;
-      setPayload((prev) => {
-        if (prev.capsuleSize !== next.capsuleSize) {
-          const { width, height } = SIZE_MAP[next.capsuleSize];
-          const win = getCurrentWindow();
-          void win.setMinSize(new LogicalSize(180, 40));
-          void win.setSize(new LogicalSize(width, height));
-        }
-        return next;
-      });
+      setPayload(event.payload);
     });
     return () => {
       void unlisten.then((dispose) => dispose());
     };
-  }, []);
+  }, [isTauriRuntime]);
 
   const elapsed = payload.startedAt ? Math.max(0, now - payload.startedAt) : 0;
   const elapsedText = formatElapsed(elapsed);
   const shouldShowElapsed = payload.state === "recording";
   const detailText = capsuleDetailText(payload);
-  const startCapsuleDrag = (event: PointerEvent<HTMLElement>) => {
+  const displaySize = getCapsuleDisplaySize(payload.capsuleSize, payload.state);
+
+  useEffect(() => {
+    if (!isTauriRuntime) return;
+    const { width, height } = SIZE_MAP[displaySize];
+    const win = getCurrentWindow();
+    void win.setMinSize(new LogicalSize(44, 44)).catch(() => undefined);
+    void win.setSize(new LogicalSize(width, height)).catch(() => undefined);
+  }, [displaySize, isTauriRuntime]);
+
+  const handlePointerDown = (event: PointerEvent<HTMLElement>) => {
+    if (!isTauriRuntime) return;
     if (event.button !== 0) return;
+    pointerStartRef.current = { x: event.clientX, y: event.clientY };
+  };
+  const handlePointerMove = (event: PointerEvent<HTMLElement>) => {
+    if (!isTauriRuntime) return;
+    const start = pointerStartRef.current;
+    if (!start) return;
+    const moved = Math.hypot(event.clientX - start.x, event.clientY - start.y);
+    if (moved < 4) return;
+    pointerStartRef.current = null;
     void getCurrentWindow().startDragging();
+  };
+  const handlePointerUp = () => {
+    if (!isTauriRuntime) return;
+    if (!pointerStartRef.current) return;
+    pointerStartRef.current = null;
+    void emit("capsule-toggle-request");
+  };
+  const handleKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (!isTauriRuntime) return;
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    void emit("capsule-toggle-request");
   };
 
   return (
     <main
-      className={`floating-capsule floating-capsule--${payload.capsuleSize} ${payload.state}`}
-      data-tauri-drag-region
-      onPointerDown={startCapsuleDrag}
+      className={`floating-capsule floating-capsule--${displaySize} ${payload.state}`}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onPointerCancel={() => {
+        pointerStartRef.current = null;
+      }}
+      onKeyDown={handleKeyDown}
+      role="button"
+      tabIndex={0}
+      aria-label="切换录音"
     >
       <div className="capsule-core">
         <div className="capsule-orb" aria-hidden="true">
-          <Waves size={18} />
+          <CapsuleStateIcon state={payload.state} />
         </div>
         <div className="capsule-copy">
           <div className="capsule-topline">
-            <span>{stateLabel(payload.state)}</span>
+            <span>{capsuleStateLabel(payload.state)}</span>
             {shouldShowElapsed ? <strong>{elapsedText}</strong> : null}
           </div>
           <p>{detailText}</p>
         </div>
-        <div className="capsule-meter" aria-hidden="true">
-          <span />
-          <span />
-          <span />
-          <span />
-        </div>
+        <CapsuleActivityMeter state={payload.state} />
       </div>
     </main>
   );
@@ -101,14 +138,6 @@ function capsuleDetailText(payload: CapsulePayload) {
     return "正在转写并整理文本";
   }
   return payload.status;
-}
-
-function stateLabel(state: RuntimeState) {
-  if (state === "recording") return "正在录音";
-  if (state === "processing") return "转写中";
-  if (state === "inserted") return "已插入";
-  if (state === "error") return "出错";
-  return "待命";
 }
 
 function formatElapsed(ms: number) {
