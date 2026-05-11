@@ -6,7 +6,7 @@ use crate::modifier_hotkey;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionStatus {
-    pub microphone: String,        // granted | denied | unknown
+    pub microphone: String, // granted | denied | unknown
     pub input_monitoring: String,
     pub accessibility: String,
 }

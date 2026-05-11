@@ -1,4 +1,5 @@
 use crate::app_config::AppConfig;
+use crate::local_asr;
 use crate::secret_store;
 use serde::Serialize;
 use std::time::{Duration, Instant};
@@ -6,7 +7,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProbeResult {
-    pub status: String,        // healthy | degraded | down | unknown | unconfigured
+    pub status: String, // healthy | degraded | down | unknown | unconfigured
     pub latency_ms: Option<u64>,
     pub message: Option<String>,
     pub checked_at: u64,
@@ -72,6 +73,8 @@ pub async fn probe_asr(config: &AppConfig) -> ProbeResult {
     match config.asr_provider.as_str() {
         "whisper_compatible" => probe_whisper_compatible(config).await,
         "volcengine" => probe_volcengine(config),
+        "stepfun_streaming" => probe_stepfun_streaming(config),
+        "local_hybrid" => probe_local_hybrid(config).await,
         other => ProbeResult::unknown(&format!("未知 ASR Provider：{other}")),
     }
 }
@@ -116,6 +119,27 @@ fn probe_volcengine(config: &AppConfig) -> ProbeResult {
     }
     // No public probe endpoint; report unknown rather than mistakenly down.
     ProbeResult::unknown("Volcengine 无公开探测路径")
+}
+
+fn probe_stepfun_streaming(config: &AppConfig) -> ProbeResult {
+    let api_key = secret_store::resolve_asr_api_key(&config.asr_api_key);
+    if api_key.trim().is_empty() {
+        return ProbeResult::unconfigured("未配置 StepFun ASR API Key");
+    }
+    ProbeResult::unknown("StepFun 实时 ASR 会在录音时建立 WebSocket 验证")
+}
+
+async fn probe_local_hybrid(config: &AppConfig) -> ProbeResult {
+    let started = Instant::now();
+    let status = local_asr::status(Some(config), None).await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    if status.installed && status.runtime_reachable {
+        ProbeResult::healthy(latency_ms)
+    } else if status.installed {
+        ProbeResult::degraded(latency_ms, "本地模型已安装，但 qwen_asr 识别引擎不可用")
+    } else {
+        ProbeResult::unconfigured("本地 ASR 模型未安装")
+    }
 }
 
 async fn probe_http_get(url: &str, api_key: &str) -> ProbeResult {

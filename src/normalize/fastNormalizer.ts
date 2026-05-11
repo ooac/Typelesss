@@ -1,4 +1,8 @@
-import { canonicalizeDictionaryTerms } from "../dictionary/builtin.js";
+import {
+  BUILTIN_AI_CODING_DICTIONARY,
+  canonicalizeDictionaryTerms,
+  type DictionaryEntry,
+} from "../dictionary/builtin.js";
 import type { DictationMode, LanguageMode, NormalizedCandidate } from "../types.js";
 import { detectLanguageMode, normalizeMixedSpacing } from "./mixedSpacing.js";
 import {
@@ -11,6 +15,7 @@ export interface FastNormalizerOptions {
   sessionId?: string;
   mode?: DictationMode;
   languageMode?: LanguageMode;
+  dictionaryEntries?: DictionaryEntry[];
 }
 
 const ZH_LEADING_FILLERS = /^(?:\s*(?:呃|嗯|啊|那个|就是|怎么说呢|你知道吧|然后呢)\s*)+/u;
@@ -36,7 +41,10 @@ export class FastNormalizer {
     if (punctuated !== text) operations.push("spoken_punctuation");
     text = punctuated;
 
-    const dictionaryResult = canonicalizeDictionaryTerms(text);
+    const dictionaryResult = canonicalizeDictionaryTerms(text, [
+      ...BUILTIN_AI_CODING_DICTIONARY,
+      ...(options.dictionaryEntries ?? []),
+    ]);
     if (dictionaryResult.text !== text) operations.push("dictionary_canonicalization");
     text = dictionaryResult.text;
 
@@ -165,8 +173,10 @@ function estimateConfidence(rawText: string, normalizedText: string, hits: strin
   return Math.min(0.99, Number(confidence.toFixed(2)));
 }
 
-function shouldUseLlm(text: string, mode: DictationMode): boolean {
+function shouldUseLlm(_text: string, mode: DictationMode): boolean {
   if (mode === "fast_dictation") return false;
   if (mode === "prompt_builder" || mode === "code_prompt") return true;
-  return text.length > 80 || /[，,]\s*(然后|但是|不过|所以)/.test(text);
+  // Smart polish stays on the local fast path; remote LLM polish is too slow
+  // for the default dictation loop and should only run in explicit prompt modes.
+  return false;
 }

@@ -1,6 +1,7 @@
 mod app_config;
 mod health;
 mod insertion;
+mod local_asr;
 mod modifier_hotkey;
 mod permissions;
 mod providers;
@@ -14,7 +15,7 @@ use recorder::{Recorder, RecordingResult};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
@@ -32,6 +33,8 @@ struct AppState {
     /// resolve which preset fired in the global-shortcut handler and to unregister
     /// cleanly when presets change.
     shortcut_registry: Arc<Mutex<Vec<(String, Shortcut)>>>,
+    local_asr_process: Mutex<Option<Child>>,
+    local_asr_downloads: Arc<local_asr::LocalAsrDownloadState>,
 }
 
 #[tauri::command]
@@ -52,7 +55,11 @@ fn save_config(
 }
 
 #[tauri::command]
-fn start_recording(state: tauri::State<AppState>) -> Result<(), String> {
+fn start_recording(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    config: AppConfig,
+) -> Result<(), String> {
     let insert_target = insertion::capture_insert_target()
         .map_err(|err| {
             eprintln!("failed to capture insert target: {err}");
@@ -60,16 +67,27 @@ fn start_recording(state: tauri::State<AppState>) -> Result<(), String> {
         })
         .ok()
         .flatten();
+    if let Some(target) = insert_target.as_ref() {
+        eprintln!(
+            "captured insert target: {} ({})",
+            target.app_name, target.pid
+        );
+    } else {
+        eprintln!("captured insert target: none");
+    }
     *state
         .insert_target
         .lock()
         .map_err(|_| "插入目标状态锁定失败".to_string())? = insert_target;
 
+    let realtime_tx =
+        providers::start_realtime_asr(&app, &config).map_err(|err| err.to_string())?;
+
     state
         .recorder
         .lock()
         .map_err(|_| "录音状态锁定失败".to_string())?
-        .start()
+        .start_with_realtime(realtime_tx)
         .map_err(|err| err.to_string())
 }
 
@@ -122,8 +140,169 @@ async fn probe_polish_endpoint(config: AppConfig) -> Result<health::ProbeResult,
 }
 
 #[tauri::command]
-fn check_secret_status() -> health::SecretStatus {
-    health::secret_status()
+async fn check_secret_status() -> Result<health::SecretStatus, String> {
+    tauri::async_runtime::spawn_blocking(health::secret_status)
+        .await
+        .map_err(|err| format!("读取 Keychain 状态失败：{err}"))
+}
+
+#[tauri::command]
+async fn local_asr_status(
+    state: tauri::State<'_, AppState>,
+    config: AppConfig,
+) -> Result<local_asr::LocalAsrStatus, String> {
+    Ok(local_asr::status(Some(&config), Some(&state.local_asr_downloads)).await)
+}
+
+#[tauri::command]
+async fn install_local_asr_models(
+    state: tauri::State<'_, AppState>,
+) -> Result<local_asr::LocalAsrStatus, String> {
+    local_asr::install_models(Some(&state.local_asr_downloads))
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn install_local_asr_runtime(
+    state: tauri::State<'_, AppState>,
+) -> Result<local_asr::LocalAsrStatus, String> {
+    local_asr::install_runtime(Some(&state.local_asr_downloads))
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn open_local_asr_models_dir() -> Result<String, String> {
+    local_asr::open_models_dir().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn list_local_asr_models(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<local_asr::LocalModelStatus>, String> {
+    let config = load_config_from_disk().ok();
+    Ok(local_asr::list_models(config.as_ref(), Some(&state.local_asr_downloads)).await)
+}
+
+#[tauri::command]
+async fn download_local_asr_model(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    model_id: String,
+    mirror: Option<String>,
+) -> Result<local_asr::LocalAsrStatus, String> {
+    local_asr::download_model(
+        app,
+        &model_id,
+        local_asr::DownloadMirror::from_str(mirror.as_deref().unwrap_or_default()),
+        Arc::clone(&state.local_asr_downloads),
+    )
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn cancel_local_asr_download(
+    state: tauri::State<'_, AppState>,
+    model_id: String,
+) -> Result<(), String> {
+    local_asr::cancel_download(&model_id, &state.local_asr_downloads).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn activate_local_asr_model(
+    state: tauri::State<'_, AppState>,
+    model_id: String,
+) -> Result<local_asr::LocalAsrStatus, String> {
+    local_asr::activate_model(&model_id, Some(&state.local_asr_downloads))
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn delete_local_asr_model(
+    state: tauri::State<'_, AppState>,
+    model_id: String,
+) -> Result<local_asr::LocalAsrStatus, String> {
+    local_asr::delete_model(&model_id, Some(&state.local_asr_downloads))
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn start_local_asr_runtime(
+    state: tauri::State<'_, AppState>,
+    config: AppConfig,
+) -> Result<local_asr::LocalAsrStatus, String> {
+    if local_asr::status(Some(&config), Some(&state.local_asr_downloads))
+        .await
+        .runtime_reachable
+    {
+        return Ok(local_asr::status(Some(&config), Some(&state.local_asr_downloads)).await);
+    }
+
+    let already_running = {
+        let mut process = state
+            .local_asr_process
+            .lock()
+            .map_err(|_| "本地 ASR runtime 状态锁定失败".to_string())?;
+        if let Some(child) = process.as_mut() {
+            if child.try_wait().map_err(|err| err.to_string())?.is_none() {
+                true
+            } else {
+                *process = None;
+                false
+            }
+        } else {
+            false
+        }
+    };
+    if already_running {
+        return Ok(local_asr::status(Some(&config), Some(&state.local_asr_downloads)).await);
+    }
+
+    {
+        let mut process = state
+            .local_asr_process
+            .lock()
+            .map_err(|_| "本地 ASR runtime 状态锁定失败".to_string())?;
+        let mut command =
+            local_asr::build_online_server_command(&config).map_err(|err| err.to_string())?;
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        let child = command
+            .spawn()
+            .map_err(|err| format!("启动本地 ASR runtime 失败：{err}"))?;
+        *process = Some(child);
+    }
+
+    for _ in 0..20 {
+        let status = local_asr::status(Some(&config), Some(&state.local_asr_downloads)).await;
+        if status.runtime_reachable {
+            return Ok(status);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+
+    Ok(local_asr::status(Some(&config), Some(&state.local_asr_downloads)).await)
+}
+
+#[tauri::command]
+async fn stop_local_asr_runtime(
+    state: tauri::State<'_, AppState>,
+    config: AppConfig,
+) -> Result<local_asr::LocalAsrStatus, String> {
+    {
+        let mut process = state
+            .local_asr_process
+            .lock()
+            .map_err(|_| "本地 ASR runtime 状态锁定失败".to_string())?;
+        if let Some(mut child) = process.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    Ok(local_asr::status(Some(&config), Some(&state.local_asr_downloads)).await)
 }
 
 #[tauri::command]
@@ -143,6 +322,19 @@ fn paste_text(state: tauri::State<AppState>, text: String) -> Result<String, Str
         .lock()
         .map_err(|_| "插入目标状态锁定失败".to_string())?
         .take();
+    if let Some(target) = insert_target.as_ref() {
+        eprintln!(
+            "paste_text invoked: {} chars, target {} ({})",
+            text.chars().count(),
+            target.app_name,
+            target.pid
+        );
+    } else {
+        eprintln!(
+            "paste_text invoked: {} chars, target none",
+            text.chars().count()
+        );
+    }
     insertion::paste_text(&text, insert_target.as_ref()).map_err(|err| err.to_string())
 }
 
@@ -296,9 +488,7 @@ fn register_presets(
         registry.clear();
     }
 
-    let right_option_used = normalized
-        .iter()
-        .any(|(_, hk)| hk == RIGHT_OPTION_HOTKEY);
+    let right_option_used = normalized.iter().any(|(_, hk)| hk == RIGHT_OPTION_HOTKEY);
     {
         let mut current = state
             .hotkey
@@ -450,10 +640,11 @@ pub fn run() {
         })
         .build();
 
-    let history_migrations = vec![Migration {
-        version: 1,
-        description: "create dictation_sessions and correction_pairs tables",
-        sql: r#"
+    let history_migrations = vec![
+        Migration {
+            version: 1,
+            description: "create dictation_sessions and correction_pairs tables",
+            sql: r#"
             CREATE TABLE IF NOT EXISTS dictation_sessions (
                 id TEXT PRIMARY KEY,
                 started_at INTEGER NOT NULL,
@@ -480,8 +671,59 @@ pub fn run() {
             CREATE INDEX IF NOT EXISTS idx_corrections_session_id
                 ON correction_pairs (session_id);
         "#,
-        kind: MigrationKind::Up,
-    }];
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 2,
+            description: "create asr telemetry and personal memory tables",
+            sql: r#"
+            CREATE TABLE IF NOT EXISTS asr_telemetry (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL DEFAULT '',
+                target_app TEXT NOT NULL DEFAULT '',
+                hotkey_down_at INTEGER,
+                first_audio_sent_at INTEGER,
+                first_partial_at INTEGER,
+                stable_insert_at INTEGER,
+                final_received_at INTEGER,
+                insert_done_at INTEGER,
+                asr_latency_ms INTEGER,
+                final_latency_ms INTEGER,
+                insert_latency_ms INTEGER,
+                error TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES dictation_sessions(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_asr_telemetry_provider_created
+                ON asr_telemetry (provider_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS personal_terms (
+                id TEXT PRIMARY KEY,
+                canonical TEXT NOT NULL UNIQUE,
+                aliases_json TEXT NOT NULL DEFAULT '[]',
+                category TEXT NOT NULL DEFAULT 'personal',
+                source TEXT NOT NULL DEFAULT 'session',
+                weight REAL NOT NULL DEFAULT 1,
+                usage_count INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_personal_terms_last_seen
+                ON personal_terms (last_seen_at DESC);
+
+            CREATE TABLE IF NOT EXISTS app_context_profiles (
+                app_id TEXT PRIMARY KEY,
+                app_name TEXT NOT NULL DEFAULT '',
+                preferred_output_mode TEXT NOT NULL DEFAULT '',
+                term_boost_json TEXT NOT NULL DEFAULT '[]',
+                last_used_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+        "#,
+            kind: MigrationKind::Up,
+        },
+    ];
 
     tauri::Builder::default()
         .plugin(global_shortcut_plugin)
@@ -496,6 +738,8 @@ pub fn run() {
             hotkey: Arc::clone(&active_hotkey),
             modifier_hotkey: ModifierHotkeyState::new(active_hotkey),
             shortcut_registry,
+            local_asr_process: Mutex::new(None),
+            local_asr_downloads: Arc::new(local_asr::LocalAsrDownloadState::new()),
         })
         .setup(|app| {
             let _ = app.path().app_config_dir();
@@ -545,6 +789,17 @@ pub fn run() {
             probe_asr_endpoint,
             probe_polish_endpoint,
             check_secret_status,
+            local_asr_status,
+            install_local_asr_models,
+            install_local_asr_runtime,
+            open_local_asr_models_dir,
+            list_local_asr_models,
+            download_local_asr_model,
+            cancel_local_asr_download,
+            activate_local_asr_model,
+            delete_local_asr_model,
+            start_local_asr_runtime,
+            stop_local_asr_runtime,
             check_permissions,
             test_microphone
         ])

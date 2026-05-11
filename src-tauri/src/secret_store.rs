@@ -30,7 +30,7 @@ pub fn resolve_volcengine_access_token(value: &str) -> String {
 }
 
 fn set_if_present(account: &str, value: &str) -> Result<()> {
-    let trimmed = value.trim();
+    let trimmed = normalize_secret_value(value);
     if trimmed.is_empty() {
         return Ok(());
     }
@@ -41,11 +41,62 @@ fn set_if_present(account: &str, value: &str) -> Result<()> {
 
 fn resolve_secret(account: &str, fallback: &str) -> String {
     if !fallback.trim().is_empty() {
-        return fallback.trim().to_string();
+        return normalize_secret_value(fallback);
     }
 
     get_generic_password(SERVICE, account)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|value| normalize_secret_value(&value))
         .unwrap_or_default()
+}
+
+fn normalize_secret_value(value: &str) -> String {
+    let trimmed = value.trim();
+    let decoded = decode_hex_if_needed(trimmed);
+    let candidate = decoded.trim();
+    let key_start = candidate.find("sk-").unwrap_or(0);
+    candidate[key_start..]
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | '，' | ';' | '；'))
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn decode_hex_if_needed(value: &str) -> String {
+    if value.len() % 2 != 0 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return value.to_string();
+    }
+
+    let bytes = (0..value.len())
+        .step_by(2)
+        .filter_map(|idx| u8::from_str_radix(&value[idx..idx + 2], 16).ok())
+        .collect::<Vec<_>>();
+
+    match String::from_utf8(bytes) {
+        Ok(decoded) if decoded.contains("sk-") => decoded,
+        _ => value.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_secret_value;
+
+    #[test]
+    fn strips_accidentally_pasted_model_suffix() {
+        assert_eq!(
+            normalize_secret_value("sk-valid-token，FunAudioLLM/SenseVoiceSmall"),
+            "sk-valid-token"
+        );
+    }
+
+    #[test]
+    fn decodes_security_cli_hex_output_when_needed() {
+        assert_eq!(
+            normalize_secret_value("736b2d76616c69642d746f6b656eefbc8c6d6f64656c"),
+            "sk-valid-token"
+        );
+    }
 }

@@ -6,7 +6,7 @@ import type { CapsulePayload, CapsuleSize } from "./appTypes.js";
 import {
   CapsuleActivityMeter,
   CapsuleStateIcon,
-  capsuleStateLabel,
+  capsuleDisplayLabel,
   getCapsuleDisplaySize,
 } from "./components/CapsuleVisuals.js";
 
@@ -116,7 +116,7 @@ export function CapsuleWindow() {
         </div>
         <div className="capsule-copy">
           <div className="capsule-topline">
-            <span>{capsuleStateLabel(payload.state)}</span>
+            <span>{capsuleDisplayLabel(payload.state, payload.previewText || payload.status)}</span>
             {shouldShowElapsed ? <strong>{elapsedText}</strong> : null}
           </div>
           <p>{detailText}</p>
@@ -128,6 +128,9 @@ export function CapsuleWindow() {
 }
 
 function capsuleDetailText(payload: CapsulePayload) {
+  if (payload.state === "error") {
+    return payload.status;
+  }
   if (payload.previewText.trim()) {
     return payload.previewText.trim().slice(0, 34);
   }

@@ -47,4 +47,20 @@ describe("FastNormalizer", () => {
       "在 `coordinator` 里面监听 `TranscriptEvent`：\n\n1. `partial` 时更新 `capsule`。\n2. `stable` 时更新 `ShadowBuffer`。\n3. `final` 时调用 polish。",
     );
   });
+
+  it("应用个人记忆词典", () => {
+    const result = normalizeFast("以后这里都叫 type less 本地模型。", {
+      dictionaryEntries: [
+        {
+          canonical: "Typeless Local",
+          aliases: ["type less 本地模型"],
+          category: "product",
+          language: "mixed",
+        },
+      ],
+    });
+
+    assert.equal(result.normalizedText, "以后这里都叫 Typeless Local。");
+    assert.deepEqual(result.dictionaryHits, ["Typeless Local"]);
+  });
 });

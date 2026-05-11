@@ -1,5 +1,10 @@
 import { Keyboard, Save, Settings } from "lucide-react";
 import { useState, type KeyboardEvent } from "react";
+import {
+  localHybridDefaults,
+  stepfunRealtimeDefaults,
+  whisperCompatibleDefaults,
+} from "./appDefaults.js";
 import type { AppConfig, AsrProvider, PolishProvider } from "./appTypes.js";
 import { formatHotkey, hotkeyFromKeyboardInput } from "./hotkey.js";
 import type { DictationMode } from "./types.js";
@@ -26,6 +31,36 @@ export function SettingsForm({
   const [isCapturingHotkey, setIsCapturingHotkey] = useState(false);
   const update = <K extends keyof AppConfig>(key: K, value: AppConfig[K]) =>
     setConfig({ ...config, [key]: value });
+  const updateAsrProvider = (provider: AsrProvider) => {
+    if (provider === "local_hybrid") {
+      setConfig({
+        ...config,
+        asrProvider: provider,
+        asrEndpoint: localHybridDefaults.endpoint,
+        asrModel: localHybridDefaults.model,
+      });
+      return;
+    }
+    if (provider === "stepfun_streaming") {
+      setConfig({
+        ...config,
+        asrProvider: provider,
+        asrEndpoint: stepfunRealtimeDefaults.endpoint,
+        asrModel: stepfunRealtimeDefaults.model,
+      });
+      return;
+    }
+    if (provider === "whisper_compatible") {
+      setConfig({
+        ...config,
+        asrProvider: provider,
+        asrEndpoint: whisperCompatibleDefaults.endpoint,
+        asrModel: whisperCompatibleDefaults.model,
+      });
+      return;
+    }
+    update("asrProvider", provider);
+  };
   const setHotkeyCapture = (isCapturing: boolean) => {
     setIsCapturingHotkey(isCapturing);
     onHotkeyCaptureChange(isCapturing);
@@ -58,23 +93,29 @@ export function SettingsForm({
     <div className="settings-form">
       <label>
         ASR 服务商
-        <select value={config.asrProvider} onChange={(event) => update("asrProvider", event.target.value as AsrProvider)}>
+        <select value={config.asrProvider} onChange={(event) => updateAsrProvider(event.target.value as AsrProvider)}>
+          <option value="local_hybrid">本地混合 ASR</option>
+          <option value="stepfun_streaming">StepFun 实时 ASR</option>
           <option value="whisper_compatible">硅基流动 / Whisper-compatible</option>
           <option value="volcengine">Volcengine streaming（配置预留）</option>
         </select>
       </label>
-      <label>
-        ASR 接口
-        <input value={config.asrEndpoint} onChange={(event) => update("asrEndpoint", event.target.value)} />
-      </label>
-      <label>
-        ASR API Key
-        <input type="password" value={config.asrApiKey} onChange={(event) => update("asrApiKey", event.target.value)} />
-      </label>
-      <label>
-        ASR 模型
-        <input value={config.asrModel} onChange={(event) => update("asrModel", event.target.value)} />
-      </label>
+      {config.asrProvider !== "local_hybrid" ? (
+        <>
+          <label>
+            ASR 接口
+            <input value={config.asrEndpoint} onChange={(event) => update("asrEndpoint", event.target.value)} />
+          </label>
+          <label>
+            ASR API Key
+            <input type="password" value={config.asrApiKey} onChange={(event) => update("asrApiKey", event.target.value)} />
+          </label>
+          <label>
+            ASR 模型
+            <input value={config.asrModel} onChange={(event) => update("asrModel", event.target.value)} />
+          </label>
+        </>
+      ) : null}
       <label>
         Volcengine 应用 ID
         <input value={config.volcengineAppId} onChange={(event) => update("volcengineAppId", event.target.value)} />

@@ -33,6 +33,7 @@
         "backgroundColor": "#00000000",
         "shadow": false,
         "alwaysOnTop": true,
+        "focusable": false,
         "skipTaskbar": true,
         "x": 760,
         "y": 80

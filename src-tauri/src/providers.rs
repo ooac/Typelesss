@@ -1,25 +1,383 @@
 use crate::app_config::AppConfig;
+use crate::local_asr;
 use crate::secret_store;
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::multipart::{Form, Part};
-use serde_json::json;
+use serde::Serialize;
+use serde_json::{json, Value};
 use std::{
     fs,
     io::{Read, Write},
+    sync::OnceLock,
+    time::{Duration, Instant},
 };
+use tauri::{AppHandle, Emitter};
+use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{client::IntoClientRequest, Message},
 };
 
+const ASR_HTTP_TIMEOUT: Duration = Duration::from_secs(25);
+const POLISH_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
+const STEPFUN_STREAM_ENDPOINT: &str = "wss://api.stepfun.com/v1/realtime/asr/stream";
+const STEPFUN_STREAM_MODEL: &str = "step-asr-1.1-stream";
+const REALTIME_FINAL_WAIT: Duration = Duration::from_millis(1200);
+
+static ASR_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+static POLISH_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
 pub async fn transcribe_audio(config: &AppConfig, wav_path: &str) -> Result<String> {
     match config.asr_provider.as_str() {
         "whisper_compatible" => transcribe_whisper_compatible(config, wav_path).await,
         "volcengine" => transcribe_volcengine_streaming(config, wav_path).await,
+        "local_hybrid" => transcribe_local_hybrid(config, wav_path).await,
+        "stepfun_streaming" => Err(anyhow!(
+            "StepFun 实时 ASR 未返回 final，不能走 batch 转写。请检查实时连接或切回硅基流动 fallback。"
+        )),
         other => Err(anyhow!("未知 ASR Provider：{other}")),
     }
+}
+
+#[derive(Debug)]
+pub enum RealtimeAsrCommand {
+    Audio(Vec<i16>),
+    Commit,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TranscriptEventPayload {
+    session_id: String,
+    kind: String,
+    text: String,
+    provider_id: String,
+    timestamp_ms: u64,
+    recoverable: Option<bool>,
+    error_message: Option<String>,
+}
+
+pub fn start_realtime_asr(
+    app: &AppHandle,
+    config: &AppConfig,
+) -> Result<Option<UnboundedSender<RealtimeAsrCommand>>> {
+    match config.asr_provider.as_str() {
+        "stepfun_streaming" => start_stepfun_realtime_asr(app.clone(), config).map(Some),
+        "local_hybrid" => Ok(None),
+        _ => Ok(None),
+    }
+}
+
+fn start_stepfun_realtime_asr(
+    app: AppHandle,
+    config: &AppConfig,
+) -> Result<UnboundedSender<RealtimeAsrCommand>> {
+    let api_key = secret_store::resolve_asr_api_key(&config.asr_api_key);
+    if api_key.trim().is_empty() {
+        return Err(anyhow!("请先填写 StepFun ASR API Key"));
+    }
+
+    let endpoint = realtime_endpoint_or_default(&config.asr_endpoint);
+    let model = if config.asr_model.trim().is_empty() {
+        STEPFUN_STREAM_MODEL.to_string()
+    } else {
+        config.asr_model.trim().to_string()
+    };
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let provider_id = "stepfun_streaming".to_string();
+    let prompt = asr_hotword_prompt();
+    let (tx, mut rx) = mpsc::unbounded_channel::<RealtimeAsrCommand>();
+
+    tauri::async_runtime::spawn(async move {
+        let result: Result<()> = async {
+            let mut request = endpoint
+                .into_client_request()
+                .context("无法创建 StepFun 实时 ASR WebSocket 请求")?;
+            request.headers_mut().insert(
+                "Authorization",
+                format!("Bearer {}", api_key.trim()).parse()?,
+            );
+
+            let (mut ws, _) = connect_async(request)
+                .await
+                .context("无法连接 StepFun 实时 ASR")?;
+
+            let session_update = json!({
+                "event_id": format!("evt_{}", uuid::Uuid::new_v4()),
+                "type": "session.update",
+                "session": {
+                    "audio": {
+                        "input": {
+                            "format": {
+                                "type": "pcm",
+                                "codec": "pcm_s16le",
+                                "rate": 16000,
+                                "bits": 16,
+                                "channel": 1
+                            },
+                            "transcription": {
+                                "model": model,
+                                "language": "zh",
+                                "prompt": prompt,
+                                "full_rerun_on_commit": true,
+                                "enable_itn": true
+                            }
+                        }
+                    }
+                }
+            });
+            ws.send(Message::Text(session_update.to_string().into()))
+                .await
+                .context("发送 StepFun session.update 失败")?;
+
+            let mut best_text = String::new();
+            let mut committed_at: Option<Instant> = None;
+            loop {
+                let final_timeout = committed_at
+                    .map(|at| REALTIME_FINAL_WAIT.saturating_sub(at.elapsed()))
+                    .unwrap_or(Duration::from_secs(3600));
+
+                tokio::select! {
+                    command = rx.recv() => {
+                        match command {
+                            Some(RealtimeAsrCommand::Audio(samples)) => {
+                                if committed_at.is_none() {
+                                    let audio = pcm_i16_to_le_bytes(&samples);
+                                    let append = json!({
+                                        "event_id": format!("evt_{}", uuid::Uuid::new_v4()),
+                                        "type": "input_audio_buffer.append",
+                                        "audio": BASE64_STANDARD.encode(audio)
+                                    });
+                                    ws.send(Message::Text(append.to_string().into()))
+                                        .await
+                                        .context("发送 StepFun 音频分片失败")?;
+                                }
+                            }
+                            Some(RealtimeAsrCommand::Commit) => {
+                                if committed_at.is_none() {
+                                    committed_at = Some(Instant::now());
+                                    let commit = json!({
+                                        "event_id": format!("evt_{}", uuid::Uuid::new_v4()),
+                                        "type": "input_audio_buffer.commit"
+                                    });
+                                    ws.send(Message::Text(commit.to_string().into()))
+                                        .await
+                                        .context("发送 StepFun commit 失败")?;
+                                }
+                            }
+                            Some(RealtimeAsrCommand::Cancel) => {
+                                let _ = ws.close(None).await;
+                                break;
+                            }
+                            None => {
+                                if committed_at.is_none() {
+                                    let _ = ws.close(None).await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    message = ws.next() => {
+                        match message {
+                            Some(Ok(Message::Text(text))) => {
+                                if handle_stepfun_message(&app, &session_id, &provider_id, &text, &mut best_text)? {
+                                    break;
+                                }
+                            }
+                            Some(Ok(Message::Binary(bytes))) => {
+                                if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                                    if handle_stepfun_message(&app, &session_id, &provider_id, &text, &mut best_text)? {
+                                        break;
+                                    }
+                                }
+                            }
+                            Some(Ok(Message::Close(_))) | None => {
+                                emit_best_text_as_final(&app, &session_id, &provider_id, &best_text);
+                                break;
+                            }
+                            Some(Ok(_)) => {}
+                            Some(Err(err)) => return Err(anyhow!("读取 StepFun 实时 ASR 响应失败：{err}")),
+                        }
+                    }
+                    _ = tokio::time::sleep(final_timeout), if committed_at.is_some() => {
+                        emit_best_text_as_final(&app, &session_id, &provider_id, &best_text);
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = result {
+            emit_transcript_event(
+                &app,
+                &session_id,
+                "error",
+                "",
+                &provider_id,
+                Some(false),
+                Some(&err.to_string()),
+            );
+        }
+    });
+
+    Ok(tx)
+}
+
+fn emit_best_text_as_final(app: &AppHandle, session_id: &str, provider_id: &str, best_text: &str) {
+    if best_text.trim().is_empty() {
+        return;
+    }
+    emit_transcript_event(
+        app,
+        session_id,
+        "final",
+        best_text.trim(),
+        provider_id,
+        None,
+        None,
+    );
+}
+
+fn handle_stepfun_message(
+    app: &AppHandle,
+    session_id: &str,
+    provider_id: &str,
+    text: &str,
+    best_text: &mut String,
+) -> Result<bool> {
+    let value: Value = serde_json::from_str(text).context("StepFun 响应不是合法 JSON")?;
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match event_type {
+        "conversation.item.input_audio_transcription.delta" => {
+            if let Some(delta) = value.get("text").and_then(Value::as_str) {
+                let next_text = merge_stepfun_delta(best_text, delta);
+                if !next_text.trim().is_empty() {
+                    *best_text = next_text;
+                    emit_transcript_event(
+                        app,
+                        session_id,
+                        "partial",
+                        best_text,
+                        provider_id,
+                        None,
+                        None,
+                    );
+                }
+            }
+            Ok(false)
+        }
+        "conversation.item.input_audio_transcription.completed" => {
+            let transcript = value
+                .get("transcript")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("text").and_then(Value::as_str))
+                .unwrap_or(best_text.as_str())
+                .to_string();
+            if !transcript.trim().is_empty() {
+                *best_text = transcript.clone();
+                emit_transcript_event(
+                    app,
+                    session_id,
+                    "final",
+                    &transcript,
+                    provider_id,
+                    None,
+                    None,
+                );
+            }
+            Ok(true)
+        }
+        "error" => {
+            let message = value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("StepFun 实时 ASR 返回错误");
+            emit_transcript_event(
+                app,
+                session_id,
+                "error",
+                "",
+                provider_id,
+                Some(false),
+                Some(message),
+            );
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn merge_stepfun_delta(current: &str, delta: &str) -> String {
+    if delta.is_empty() {
+        return current.to_string();
+    }
+    if current.is_empty() || delta.starts_with(current) {
+        return delta.to_string();
+    }
+    if current.ends_with(delta) {
+        return current.to_string();
+    }
+    format!("{current}{delta}")
+}
+
+fn emit_transcript_event(
+    app: &AppHandle,
+    session_id: &str,
+    kind: &str,
+    text: &str,
+    provider_id: &str,
+    recoverable: Option<bool>,
+    error_message: Option<&str>,
+) {
+    let _ = app.emit(
+        "transcript-event",
+        TranscriptEventPayload {
+            session_id: session_id.to_string(),
+            kind: kind.to_string(),
+            text: text.to_string(),
+            provider_id: provider_id.to_string(),
+            timestamp_ms: current_timestamp_ms(),
+            recoverable,
+            error_message: error_message.map(str::to_string),
+        },
+    );
+}
+
+fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn pcm_i16_to_le_bytes(samples: &[i16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    bytes
+}
+
+fn realtime_endpoint_or_default(endpoint: &str) -> String {
+    let trimmed = endpoint.trim();
+    if trimmed.starts_with("wss://") || trimmed.starts_with("ws://") {
+        trimmed.to_string()
+    } else {
+        STEPFUN_STREAM_ENDPOINT.to_string()
+    }
+}
+
+fn asr_hotword_prompt() -> &'static str {
+    "请准确识别中英混输和编程术语：Claude Code、OpenAI Codex、Tauri、src-tauri、TranscriptEvent、ShadowBuffer、WebSocket、TypeScript、Rust、React、Vite。"
 }
 
 async fn transcribe_whisper_compatible(config: &AppConfig, wav_path: &str) -> Result<String> {
@@ -39,13 +397,24 @@ async fn transcribe_whisper_compatible(config: &AppConfig, wav_path: &str) -> Re
         .text("model", config.asr_model.clone())
         .part("file", part);
 
-    let response = reqwest::Client::new()
+    let started = Instant::now();
+    let response = asr_client()
         .post(config.asr_endpoint.trim())
         .bearer_auth(asr_api_key.trim())
         .multipart(form)
         .send()
         .await
-        .context("ASR 请求失败")?;
+        .map_err(|err| {
+            if err.is_timeout() {
+                anyhow!("ASR 请求超时（{}s）", ASR_HTTP_TIMEOUT.as_secs())
+            } else {
+                anyhow!("ASR 请求失败：{err}")
+            }
+        })?;
+    eprintln!(
+        "ASR request finished in {}ms",
+        started.elapsed().as_millis()
+    );
 
     let status = response.status();
     let trace_id = response
@@ -72,6 +441,10 @@ async fn transcribe_whisper_compatible(config: &AppConfig, wav_path: &str) -> Re
             json_shape(&value)
         )
     })
+}
+
+async fn transcribe_local_hybrid(config: &AppConfig, wav_path: &str) -> Result<String> {
+    local_asr::transcribe_wav(config, wav_path).await
 }
 
 async fn transcribe_volcengine_streaming(config: &AppConfig, wav_path: &str) -> Result<String> {
@@ -355,7 +728,8 @@ pub async fn polish_text(config: &AppConfig, text: &str, mode: &str) -> Result<S
 
     let system_prompt = polish_system_prompt(mode);
     let endpoint = chat_completions_endpoint(&config.polish_endpoint);
-    let response = reqwest::Client::new()
+    let started = Instant::now();
+    let response = polish_client()
         .post(endpoint)
         .bearer_auth(polish_api_key.trim())
         .json(&json!({
@@ -368,7 +742,17 @@ pub async fn polish_text(config: &AppConfig, text: &str, mode: &str) -> Result<S
         }))
         .send()
         .await
-        .context("Polish 请求失败")?;
+        .map_err(|err| {
+            if err.is_timeout() {
+                anyhow!("Polish 请求超时（{}s）", POLISH_HTTP_TIMEOUT.as_secs())
+            } else {
+                anyhow!("Polish 请求失败：{err}")
+            }
+        })?;
+    eprintln!(
+        "Polish request finished in {}ms",
+        started.elapsed().as_millis()
+    );
 
     let status = response.status();
     let body = response.text().await.context("无法读取 Polish 响应")?;
@@ -383,7 +767,31 @@ pub async fn polish_text(config: &AppConfig, text: &str, mode: &str) -> Result<S
         .and_then(|content| content.as_str())
         .map(|content| content.trim().to_string())
         .filter(|content| !content.is_empty())
+        .or_else(|| {
+            eprintln!("Polish response has no usable content, falling back to normalized text");
+            Some(text.to_string())
+        })
         .ok_or_else(|| anyhow!("Polish 响应缺少 choices[0].message.content"))
+}
+
+fn asr_client() -> &'static reqwest::Client {
+    ASR_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(ASR_HTTP_TIMEOUT)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .expect("ASR client 初始化失败")
+    })
+}
+
+fn polish_client() -> &'static reqwest::Client {
+    POLISH_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(POLISH_HTTP_TIMEOUT)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .expect("Polish client 初始化失败")
+    })
 }
 
 fn chat_completions_endpoint(endpoint: &str) -> String {
@@ -436,5 +844,13 @@ mod tests {
     fn detects_empty_top_level_text() {
         let value = json!({ "text": "   " });
         assert!(has_empty_top_level_text(&value));
+    }
+
+    #[test]
+    fn merges_stepfun_cumulative_or_incremental_delta() {
+        assert_eq!(merge_stepfun_delta("", "你好"), "你好");
+        assert_eq!(merge_stepfun_delta("你好", "你好世界"), "你好世界");
+        assert_eq!(merge_stepfun_delta("你好", "，世界"), "你好，世界");
+        assert_eq!(merge_stepfun_delta("你好", "好"), "你好");
     }
 }
