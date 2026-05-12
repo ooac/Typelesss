@@ -327,3 +327,29 @@
 - ✅ `cargo fmt --check` 通过。
 - ✅ `cargo check` 通过。
 - ✅ `cargo test` 通过，44 个测试全部通过。
+
+### 修复：长句分段覆盖导致前半句丢失 ✅
+**状态**：已完成
+**时间**：2026-05-12 12:10 - 2026-05-12 12:18
+**执行者**：LD
+
+#### 问题
+- 阿里 Paraformer realtime 的 `sentence.text` 可能返回当前分句，而不是整段累计文本。
+- 旧逻辑每次把 `best_text` 直接覆盖为最新 `sentence.text`，长句被服务端切段后，最终只剩后半句。
+
+#### 解决
+- ✅ 新增 `RealtimeTranscriptAccumulator`，区分 committed stable 文本与当前 partial preview。
+- ✅ 当前片段返回时追加到前文；累计全文返回时直接更新，避免重复拼接。
+- ✅ stable 片段才提交到 committed，partial 只作为尾部预览。
+- ✅ 增加测试覆盖“分段返回”和“累计返回”两种阿里行为。
+
+#### 相关文件
+- `src-tauri/src/providers.rs`
+
+#### 验证
+- ✅ `npm test` 通过，25 个测试全部通过。
+- ✅ `npm run build` 通过。
+- ✅ `cargo fmt --check` 通过。
+- ✅ `cargo check` 通过。
+- ✅ `cargo test` 通过，46 个测试全部通过。
+- ✅ `git diff --check` 通过。

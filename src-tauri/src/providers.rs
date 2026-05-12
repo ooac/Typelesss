@@ -307,7 +307,7 @@ fn start_alibaba_paraformer_realtime_asr(
             let mut task_started = false;
             let mut finish_requested = false;
             let mut pending_chunks: Vec<Vec<i16>> = Vec::new();
-            let mut best_text = String::new();
+            let mut transcript_accumulator = RealtimeTranscriptAccumulator::default();
             let mut committed_at: Option<Instant> = None;
 
             loop {
@@ -361,7 +361,7 @@ fn start_alibaba_paraformer_realtime_asr(
                                     &session_id,
                                     &provider_id,
                                     &text,
-                                    &mut best_text,
+                                    &mut transcript_accumulator,
                                     &mut task_started,
                                 )? {
                                     break;
@@ -386,7 +386,7 @@ fn start_alibaba_paraformer_realtime_asr(
                                         &session_id,
                                         &provider_id,
                                         &text,
-                                        &mut best_text,
+                                        &mut transcript_accumulator,
                                         &mut task_started,
                                     )? {
                                         break;
@@ -394,7 +394,7 @@ fn start_alibaba_paraformer_realtime_asr(
                                 }
                             }
                             Some(Ok(Message::Close(_))) | None => {
-                                emit_best_text_as_final(&app, &session_id, &provider_id, &best_text);
+                                emit_best_text_as_final(&app, &session_id, &provider_id, transcript_accumulator.best_text());
                                 break;
                             }
                             Some(Ok(_)) => {}
@@ -402,7 +402,7 @@ fn start_alibaba_paraformer_realtime_asr(
                         }
                     }
                     _ = tokio::time::sleep(final_timeout), if committed_at.is_some() => {
-                        emit_best_text_as_final(&app, &session_id, &provider_id, &best_text);
+                        emit_best_text_as_final(&app, &session_id, &provider_id, transcript_accumulator.best_text());
                         break;
                     }
                 }
@@ -452,7 +452,7 @@ fn handle_alibaba_message(
     session_id: &str,
     provider_id: &str,
     text: &str,
-    best_text: &mut String,
+    transcript_accumulator: &mut RealtimeTranscriptAccumulator,
     task_started: &mut bool,
 ) -> Result<bool> {
     let value: Value = serde_json::from_str(text).context("阿里 Paraformer 响应不是合法 JSON")?;
@@ -477,23 +477,29 @@ fn handle_alibaba_message(
             if text_is_usable(transcript).is_err() {
                 return Ok(false);
             }
-            *best_text = transcript.trim().to_string();
             let end_time = sentence
                 .and_then(|sentence| sentence.get("end_time").or_else(|| sentence.get("endTime")));
             let sentence_end = sentence
                 .and_then(|sentence| sentence.get("sentence_end"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let kind = if end_time.is_some_and(|value| !value.is_null()) || sentence_end {
+            let is_segment_final = end_time.is_some_and(|value| !value.is_null()) || sentence_end;
+            let merged_text = transcript_accumulator.update(transcript, is_segment_final);
+            let kind = if is_segment_final {
                 "stable"
             } else {
                 "partial"
             };
-            emit_transcript_event(app, session_id, kind, best_text, provider_id, None, None);
+            emit_transcript_event(app, session_id, kind, &merged_text, provider_id, None, None);
             Ok(false)
         }
         "task-finished" => {
-            emit_best_text_as_final(app, session_id, provider_id, best_text);
+            emit_best_text_as_final(
+                app,
+                session_id,
+                provider_id,
+                transcript_accumulator.best_text(),
+            );
             Ok(true)
         }
         "task-failed" => {
@@ -513,6 +519,74 @@ fn handle_alibaba_message(
             Ok(true)
         }
         _ => Ok(false),
+    }
+}
+
+#[derive(Default)]
+struct RealtimeTranscriptAccumulator {
+    committed: String,
+    preview: String,
+}
+
+impl RealtimeTranscriptAccumulator {
+    fn update(&mut self, transcript: &str, segment_final: bool) -> String {
+        let text = transcript.trim();
+        if text.is_empty() {
+            return self.best_text().to_string();
+        }
+
+        let next = if self.committed.is_empty() || text.starts_with(&self.committed) {
+            text.to_string()
+        } else if self.preview == text || self.preview.ends_with(text) {
+            self.preview.clone()
+        } else {
+            join_transcript_text(&self.committed, text)
+        };
+
+        self.preview = next.clone();
+        if segment_final {
+            self.committed = if self.committed.is_empty() || next.starts_with(&self.committed) {
+                next.clone()
+            } else if self.committed.ends_with(text) {
+                self.committed.clone()
+            } else {
+                join_transcript_text(&self.committed, text)
+            };
+            self.preview = self.committed.clone();
+        }
+
+        next
+    }
+
+    fn best_text(&self) -> &str {
+        if self.preview.trim().is_empty() {
+            self.committed.as_str()
+        } else {
+            self.preview.as_str()
+        }
+    }
+}
+
+fn join_transcript_text(left: &str, right: &str) -> String {
+    let left = left.trim();
+    let right = right.trim();
+    if left.is_empty() {
+        return right.to_string();
+    }
+    if right.is_empty() || left.ends_with(right) {
+        return left.to_string();
+    }
+    if right.starts_with(left) {
+        return right.to_string();
+    }
+
+    let left_last = left.chars().last().unwrap_or_default();
+    let right_first = right.chars().next().unwrap_or_default();
+    let needs_space = left_last.is_ascii_alphanumeric() && right_first.is_ascii_alphanumeric();
+    if needs_space {
+        format!("{left} {right}")
+    } else {
+        format!("{left}{right}")
     }
 }
 
@@ -1350,5 +1424,33 @@ mod tests {
         assert_eq!(merge_stepfun_delta("你好", "你好世界"), "你好世界");
         assert_eq!(merge_stepfun_delta("你好", "，世界"), "你好，世界");
         assert_eq!(merge_stepfun_delta("你好", "好"), "你好");
+    }
+
+    #[test]
+    fn accumulates_alibaba_segment_transcripts() {
+        let mut acc = RealtimeTranscriptAccumulator::default();
+
+        assert_eq!(acc.update("请帮我把这段话", false), "请帮我把这段话");
+        assert_eq!(
+            acc.update("请帮我把这段话整理得", true),
+            "请帮我把这段话整理得"
+        );
+        assert_eq!(acc.update("继续快。", true), "请帮我把这段话整理得继续快。");
+        assert_eq!(acc.best_text(), "请帮我把这段话整理得继续快。");
+    }
+
+    #[test]
+    fn accepts_cumulative_alibaba_transcripts_without_duplication() {
+        let mut acc = RealtimeTranscriptAccumulator::default();
+
+        assert_eq!(
+            acc.update("我要使用 Claude Code", true),
+            "我要使用 Claude Code"
+        );
+        assert_eq!(
+            acc.update("我要使用 Claude Code 和 OpenAI Codex", true),
+            "我要使用 Claude Code 和 OpenAI Codex"
+        );
+        assert_eq!(acc.best_text(), "我要使用 Claude Code 和 OpenAI Codex");
     }
 }
