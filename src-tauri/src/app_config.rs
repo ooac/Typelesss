@@ -10,6 +10,8 @@ const LEGACY_OPENAI_POLISH_ENDPOINT: &str = "https://api.openai.com/v1/chat/comp
 const LEGACY_OPENAI_POLISH_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_SILICONFLOW_ASR_ENDPOINT: &str = "https://api.siliconflow.cn/v1/audio/transcriptions";
 const DEFAULT_SILICONFLOW_ASR_MODEL: &str = "FunAudioLLM/SenseVoiceSmall";
+const DEFAULT_AUTO_ASR_ENDPOINT: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference/";
+const DEFAULT_AUTO_ASR_MODEL: &str = "paraformer-realtime-v2";
 const DEFAULT_DEEPSEEK_POLISH_ENDPOINT: &str = "https://api.deepseek.com/v1";
 const DEFAULT_DEEPSEEK_POLISH_MODEL: &str = "deepseek-v4-flash";
 const DEFAULT_HOTKEY: &str = "Option+Space";
@@ -31,6 +33,12 @@ pub struct AppConfig {
     pub asr_endpoint: String,
     pub asr_api_key: String,
     pub asr_model: String,
+    #[serde(default = "default_asr_provider_candidates")]
+    pub asr_provider_candidates: Vec<String>,
+    #[serde(default = "default_true")]
+    pub asr_auto_benchmark_enabled: bool,
+    #[serde(default = "default_true")]
+    pub asr_save_benchmark_audio: bool,
     pub volcengine_app_id: String,
     pub volcengine_access_token: String,
     pub volcengine_resource_id: String,
@@ -39,6 +47,12 @@ pub struct AppConfig {
     pub polish_api_key: String,
     pub polish_model: String,
     pub output_mode: String,
+    #[serde(default = "default_local_asr_mode")]
+    pub local_asr_mode: String,
+    #[serde(default = "default_local_asr_engine_id")]
+    pub local_asr_engine_id: String,
+    #[serde(default = "default_live_insert_enabled")]
+    pub live_insert_enabled: bool,
     #[serde(default = "default_capsule_size")]
     pub capsule_size: String,
     pub auto_insert: bool,
@@ -59,10 +73,13 @@ impl Default for AppConfig {
             output_mode: "smart_polish".to_string(),
         };
         Self {
-            asr_provider: "whisper_compatible".to_string(),
-            asr_endpoint: DEFAULT_SILICONFLOW_ASR_ENDPOINT.to_string(),
+            asr_provider: "auto_optimized".to_string(),
+            asr_endpoint: DEFAULT_AUTO_ASR_ENDPOINT.to_string(),
             asr_api_key: String::new(),
-            asr_model: DEFAULT_SILICONFLOW_ASR_MODEL.to_string(),
+            asr_model: DEFAULT_AUTO_ASR_MODEL.to_string(),
+            asr_provider_candidates: default_asr_provider_candidates(),
+            asr_auto_benchmark_enabled: true,
+            asr_save_benchmark_audio: true,
             volcengine_app_id: String::new(),
             volcengine_access_token: String::new(),
             volcengine_resource_id: String::new(),
@@ -71,6 +88,9 @@ impl Default for AppConfig {
             polish_api_key: String::new(),
             polish_model: DEFAULT_DEEPSEEK_POLISH_MODEL.to_string(),
             output_mode: "smart_polish".to_string(),
+            local_asr_mode: default_local_asr_mode(),
+            local_asr_engine_id: default_local_asr_engine_id(),
+            live_insert_enabled: default_live_insert_enabled(),
             capsule_size: default_capsule_size(),
             auto_insert: true,
             hotkey: default_hotkey(),
@@ -165,6 +185,31 @@ fn default_hotkey() -> String {
 
 fn default_capsule_size() -> String {
     "large".to_string()
+}
+
+fn default_local_asr_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_local_asr_engine_id() -> String {
+    "sensevoice-small".to_string()
+}
+
+fn default_asr_provider_candidates() -> Vec<String> {
+    vec![
+        "alibaba_paraformer_realtime".to_string(),
+        "volcengine".to_string(),
+        "local_hybrid".to_string(),
+        "whisper_compatible".to_string(),
+    ]
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_live_insert_enabled() -> bool {
+    false
 }
 
 #[cfg(test)]

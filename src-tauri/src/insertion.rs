@@ -93,6 +93,166 @@ pub fn paste_text(text: &str, target: Option<&InsertTarget>) -> Result<String> {
     }
 }
 
+pub fn replace_composition_text(
+    text: &str,
+    target: Option<&InsertTarget>,
+    previous_chars: usize,
+) -> Result<String> {
+    let mut clipboard = Clipboard::new().context("无法访问剪贴板")?;
+    clipboard
+        .set_text(text.to_string())
+        .context("无法写入剪贴板")?;
+    if let Some(insert_target) = target {
+        activate_insert_target(insert_target)?;
+    }
+    let mut command = Command::new("osascript");
+    command.args(["-e", &composition_replace_script(previous_chars)]);
+    let status = command_status_with_timeout(&mut command, Duration::from_secs(5))
+        .context("无法调用系统组合输入命令")?;
+    if status.success() {
+        Ok("已更新实时输入文本。".to_string())
+    } else {
+        Err(anyhow!("实时输入更新失败，已保留剪贴板内容。"))
+    }
+}
+
+pub fn read_focused_text_window(
+    target: Option<&InsertTarget>,
+    inserted_text: &str,
+) -> Result<String> {
+    if let Some(insert_target) = target {
+        activate_insert_target(insert_target)?;
+    }
+    let script = focused_text_script(target);
+    let mut command = Command::new("osascript");
+    command.args(["-e", &script]);
+    let output = command_output_with_timeout(&mut command, Duration::from_secs(2))
+        .context("无法读取目标输入框内容")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "目标输入框不支持回读：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(crop_near_inserted_text(&text, inserted_text, 240))
+}
+
+pub fn read_selected_text() -> Result<(String, Option<InsertTarget>)> {
+    let target = capture_insert_target().ok().flatten();
+    let script = selected_text_script(target.as_ref());
+    let mut command = Command::new("osascript");
+    command.args(["-e", &script]);
+    let output = command_output_with_timeout(&mut command, Duration::from_secs(2))
+        .context("无法读取当前选中文本")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "当前 App 不支持读取选中文本：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok((
+        String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        target,
+    ))
+}
+
+fn composition_replace_script(previous_chars: usize) -> String {
+    let bounded_chars = previous_chars.min(4000);
+    let mut lines = Vec::new();
+    if bounded_chars > 0 {
+        lines.push(format!(
+            r#"repeat {} times
+  tell application "System Events" to key code 123 using shift down
+end repeat"#,
+            bounded_chars
+        ));
+    }
+    lines.push(r#"tell application "System Events" to key code 9 using command down"#.to_string());
+    lines.join("\n")
+}
+
+fn focused_text_script(target: Option<&InsertTarget>) -> String {
+    let process_line = target
+        .map(|insert_target| {
+            format!(
+                r#"tell application "System Events" to set targetProcess to first application process whose unix id is {}"#,
+                insert_target.pid
+            )
+        })
+        .unwrap_or_else(|| {
+            r#"tell application "System Events" to set targetProcess to first application process whose frontmost is true"#.to_string()
+        });
+    format!(
+        r#"{process_line}
+tell application "System Events"
+  tell targetProcess
+    set frontmost to true
+    delay 0.05
+    set focusedElement to value of attribute "AXFocusedUIElement"
+    try
+      set fieldValue to value of attribute "AXValue" of focusedElement
+    on error
+      try
+        set fieldValue to value of focusedElement
+      on error
+        set fieldValue to ""
+      end try
+    end try
+    if fieldValue is missing value then return ""
+    return fieldValue as text
+  end tell
+end tell"#
+    )
+}
+
+fn selected_text_script(target: Option<&InsertTarget>) -> String {
+    let process_line = target
+        .map(|insert_target| {
+            format!(
+                r#"tell application "System Events" to set targetProcess to first application process whose unix id is {}"#,
+                insert_target.pid
+            )
+        })
+        .unwrap_or_else(|| {
+            r#"tell application "System Events" to set targetProcess to first application process whose frontmost is true"#.to_string()
+        });
+    format!(
+        r#"{process_line}
+tell application "System Events"
+  tell targetProcess
+    set focusedElement to value of attribute "AXFocusedUIElement"
+    try
+      set selectedText to value of attribute "AXSelectedText" of focusedElement
+    on error
+      set selectedText to ""
+    end try
+    if selectedText is missing value then return ""
+    return selectedText as text
+  end tell
+end tell"#
+    )
+}
+
+fn crop_near_inserted_text(text: &str, inserted_text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    if !inserted_text.is_empty() {
+        if let Some(byte_index) = text.find(inserted_text) {
+            let before = text[..byte_index].chars().count();
+            let inserted_len = inserted_text.chars().count();
+            let start = before.saturating_sub(max_chars / 3);
+            let end = (before + inserted_len + max_chars / 3).min(text.chars().count());
+            return text.chars().skip(start).take(end - start).collect();
+        }
+    }
+    let chars = text.chars().collect::<Vec<_>>();
+    chars[chars.len().saturating_sub(max_chars)..]
+        .iter()
+        .collect()
+}
+
 fn clipboard_paste_script(target: Option<&InsertTarget>) -> String {
     let mut lines = Vec::new();
     if let Some(insert_target) = target {
@@ -238,5 +398,39 @@ mod tests {
 
         assert!(script.contains("unix id is 1234"));
         assert!(script.contains("key code 9 using command down"));
+    }
+
+    #[test]
+    fn composition_replace_selects_previous_text() {
+        let script = composition_replace_script(3);
+        assert!(script.contains("repeat 3 times"));
+        assert!(script.contains("key code 123 using shift down"));
+        assert!(script.contains("key code 9 using command down"));
+    }
+
+    #[test]
+    fn focused_text_script_reads_ax_value() {
+        let script = focused_text_script(Some(&InsertTarget {
+            pid: 1234,
+            app_name: "TextEdit".to_string(),
+        }));
+        assert!(script.contains("unix id is 1234"));
+        assert!(script.contains("AXFocusedUIElement"));
+        assert!(script.contains("AXValue"));
+    }
+
+    #[test]
+    fn selected_text_script_reads_ax_selected_text() {
+        let script = selected_text_script(None);
+        assert!(script.contains("AXFocusedUIElement"));
+        assert!(script.contains("AXSelectedText"));
+    }
+
+    #[test]
+    fn crops_text_around_inserted_fragment() {
+        let text = format!("{}codeex。{}", "a".repeat(180), "b".repeat(180));
+        let cropped = crop_near_inserted_text(&text, "codeex。", 80);
+        assert!(cropped.contains("codeex。"));
+        assert!(cropped.chars().count() <= 80);
     }
 }

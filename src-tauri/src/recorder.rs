@@ -4,7 +4,7 @@ use cpal::{Sample, SampleFormat, Stream};
 use serde::Serialize;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -12,8 +12,12 @@ use crate::providers::RealtimeAsrCommand;
 
 const ASR_SAMPLE_RATE: u32 = 16_000;
 const REALTIME_CHUNK_MS: u32 = 40;
+const ASR_LEADING_SILENCE_MS: u32 = 240;
+const INPUT_WARM_UP_MS: u64 = 900;
 const REALTIME_CHUNK_SAMPLES: usize =
     (ASR_SAMPLE_RATE as usize * REALTIME_CHUNK_MS as usize) / 1000;
+const ASR_LEADING_SILENCE_SAMPLES: usize =
+    (ASR_SAMPLE_RATE as usize * ASR_LEADING_SILENCE_MS as usize) / 1000;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -74,6 +78,27 @@ impl Recorder {
     pub fn cancel(&mut self) {
         let _ = self.command_tx.send(RecorderCommand::Cancel);
     }
+}
+
+pub fn warm_up_input_device() -> Result<()> {
+    let host = cpal::default_host();
+    let device = host.default_input_device().context("找不到默认麦克风")?;
+    let supported_config = device
+        .default_input_config()
+        .context("无法读取默认麦克风配置")?;
+    let config = supported_config.config();
+    let err_fn = |err| eprintln!("microphone warm-up stream error: {err}");
+
+    let stream = match supported_config.sample_format() {
+        SampleFormat::F32 => build_warm_up_stream::<f32>(&device, &config, err_fn)?,
+        SampleFormat::I16 => build_warm_up_stream::<i16>(&device, &config, err_fn)?,
+        SampleFormat::U16 => build_warm_up_stream::<u16>(&device, &config, err_fn)?,
+        format => return Err(anyhow!("不支持的麦克风采样格式：{format:?}")),
+    };
+    stream.play().context("无法启动麦克风预热流")?;
+    std::thread::sleep(Duration::from_millis(INPUT_WARM_UP_MS));
+    drop(stream);
+    Ok(())
 }
 
 struct RecorderSession {
@@ -202,6 +227,7 @@ fn stop_session(session: RecorderSession) -> Result<RecordingResult> {
     let wav_path = path.with_extension("wav");
     let mono_samples = downmix_to_mono(&samples, session.channels);
     let asr_samples = resample_linear(&mono_samples, session.sample_rate, ASR_SAMPLE_RATE);
+    let asr_samples = with_leading_silence(&asr_samples);
     write_wav(&wav_path, ASR_SAMPLE_RATE, 1, &asr_samples)?;
 
     Ok(RecordingResult {
@@ -247,6 +273,19 @@ where
         .context("无法创建麦克风输入流")
 }
 
+fn build_warm_up_stream<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    err_fn: impl FnMut(cpal::StreamError) + Send + 'static,
+) -> Result<Stream>
+where
+    T: cpal::Sample + cpal::SizedSample,
+{
+    device
+        .build_input_stream(config, move |_data: &[T], _| {}, err_fn, None)
+        .context("无法创建麦克风预热流")
+}
+
 struct RealtimeChunker {
     source_rate: u32,
     channels: u16,
@@ -259,7 +298,7 @@ impl RealtimeChunker {
         Self {
             source_rate,
             channels,
-            pending: Vec::with_capacity(REALTIME_CHUNK_SAMPLES * 2),
+            pending: vec![0; ASR_LEADING_SILENCE_SAMPLES],
             tx,
         }
     }
@@ -284,6 +323,13 @@ impl RealtimeChunker {
             }
         }
     }
+}
+
+fn with_leading_silence(samples: &[i16]) -> Vec<i16> {
+    let mut padded = Vec::with_capacity(ASR_LEADING_SILENCE_SAMPLES + samples.len());
+    padded.resize(ASR_LEADING_SILENCE_SAMPLES, 0);
+    padded.extend_from_slice(samples);
+    padded
 }
 
 fn write_wav(
@@ -360,5 +406,15 @@ mod tests {
         assert_eq!(output.len(), 16_000);
         assert_eq!(output[0], 0);
         assert_eq!(output[1], 3);
+    }
+
+    #[test]
+    fn prepends_asr_leading_silence() {
+        let output = with_leading_silence(&[1, 2, 3]);
+        assert_eq!(output.len(), ASR_LEADING_SILENCE_SAMPLES + 3);
+        assert!(output[..ASR_LEADING_SILENCE_SAMPLES]
+            .iter()
+            .all(|sample| *sample == 0));
+        assert_eq!(&output[ASR_LEADING_SILENCE_SAMPLES..], &[1, 2, 3]);
     }
 }

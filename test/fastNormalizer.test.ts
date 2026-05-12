@@ -48,6 +48,30 @@ describe("FastNormalizer", () => {
     );
   });
 
+  it("强制规范化核心英文技术词", () => {
+    const result = normalizeFast(
+      "Claude.Claude Code, Open AI code X, tauri, src-Tauri, transcript event, shadow buffer, type script, rust, react, vite, G P D",
+    );
+
+    assert.equal(
+      result.normalizedText,
+      "Claude Code, OpenAI Codex, Tauri, src-tauri, TranscriptEvent, ShadowBuffer, TypeScript, Rust, React, Vite, GPT",
+    );
+    assert.deepEqual(new Set(result.dictionaryHits), new Set([
+      "Claude Code",
+      "OpenAI Codex",
+      "Tauri",
+      "src-tauri",
+      "TranscriptEvent",
+      "ShadowBuffer",
+      "TypeScript",
+      "Rust",
+      "React",
+      "Vite",
+      "GPT",
+    ]));
+  });
+
   it("应用个人记忆词典", () => {
     const result = normalizeFast("以后这里都叫 type less 本地模型。", {
       dictionaryEntries: [
@@ -62,5 +86,21 @@ describe("FastNormalizer", () => {
 
     assert.equal(result.normalizedText, "以后这里都叫 Typeless Local。");
     assert.deepEqual(result.dictionaryHits, ["Typeless Local"]);
+  });
+
+  it("个人纠错对优先修正常见误识别词", () => {
+    const result = normalizeFast("我要使用 codeex。", {
+      dictionaryEntries: [
+        {
+          canonical: "codex",
+          aliases: ["codeex"],
+          category: "coding",
+          language: "mixed",
+        },
+      ],
+    });
+
+    assert.equal(result.normalizedText, "我要使用 codex。");
+    assert.deepEqual(result.dictionaryHits, ["codex"]);
   });
 });

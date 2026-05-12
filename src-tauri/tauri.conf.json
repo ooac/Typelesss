@@ -40,7 +40,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self' customprotocol: asset: tauri:; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* ws://127.0.0.1:* https://api.siliconflow.cn https://api.deepseek.com https://api.stepfun.com wss://api.stepfun.com wss://openspeech.bytedance.com https://huggingface.co https://hf-mirror.com"
     }
   },
   "bundle": {

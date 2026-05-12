@@ -8,13 +8,29 @@ export interface DictionaryEntry {
 export const BUILTIN_AI_CODING_DICTIONARY: DictionaryEntry[] = [
   {
     canonical: "Claude Code",
-    aliases: ["cloud code", "clawed code", "Claude code"],
+    aliases: [
+      "Claude.Claude Code",
+      "Claude. Claude Code",
+      "Claude Claude Code",
+      "cloud code",
+      "clawed code",
+      "Claude code",
+    ],
     category: "product",
     language: "en",
   },
   {
     canonical: "OpenAI Codex",
-    aliases: ["code X", "codex", "codecks"],
+    aliases: [
+      "Open AI Codex",
+      "open ai codex",
+      "OpenAI code X",
+      "open ai code X",
+      "code X",
+      "code ex",
+      "codex",
+      "codecks",
+    ],
     category: "product",
     language: "en",
   },
@@ -55,6 +71,19 @@ export const BUILTIN_AI_CODING_DICTIONARY: DictionaryEntry[] = [
     language: "en",
   },
   {
+    canonical: "src-tauri",
+    aliases: [
+      "src-Tauri",
+      "SRC-Tauri",
+      "src tauri",
+      "SRC tauri",
+      "source tauri",
+      "source-Tauri",
+    ],
+    category: "coding",
+    language: "en",
+  },
+  {
     canonical: "WebSocket",
     aliases: ["web socket", "websocket"],
     category: "coding",
@@ -62,7 +91,13 @@ export const BUILTIN_AI_CODING_DICTIONARY: DictionaryEntry[] = [
   },
   {
     canonical: "TypeScript",
-    aliases: ["typescript", "type script"],
+    aliases: ["typescript", "type script", "type scripts"],
+    category: "coding",
+    language: "en",
+  },
+  {
+    canonical: "Rust",
+    aliases: ["rust"],
     category: "coding",
     language: "en",
   },
@@ -70,6 +105,18 @@ export const BUILTIN_AI_CODING_DICTIONARY: DictionaryEntry[] = [
     canonical: "React",
     aliases: ["react"],
     category: "framework",
+    language: "en",
+  },
+  {
+    canonical: "Vite",
+    aliases: ["vite", "veet"],
+    category: "framework",
+    language: "en",
+  },
+  {
+    canonical: "GPT",
+    aliases: ["gpt", "G P T", "G.P.T.", "G P D", "GPT"],
+    category: "model",
     language: "en",
   },
   {
@@ -112,6 +159,7 @@ export function canonicalizeDictionaryTerms(
   const replacements = entries.flatMap((entry) =>
     entry.aliases.map((alias) => ({ alias, entry })),
   );
+  const canonicalTerms = entries.map((entry) => entry.canonical);
 
   replacements.sort((a, b) => b.alias.length - a.alias.length);
 
@@ -120,7 +168,7 @@ export function canonicalizeDictionaryTerms(
     text = text.replace(pattern, (match, ...args: unknown[]) => {
       const offset = args.at(-2) as number;
       const fullText = args.at(-1) as string;
-      if (isWithinCanonicalTerm(fullText, offset, match.length, entry.canonical)) {
+      if (isWithinAnyCanonicalTerm(fullText, offset, match.length, canonicalTerms)) {
         return match;
       }
       hits.add(entry.canonical);
@@ -151,20 +199,22 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function isWithinCanonicalTerm(
+function isWithinAnyCanonicalTerm(
   text: string,
   offset: number,
   matchLength: number,
-  canonical: string,
+  canonicalTerms: string[],
 ): boolean {
-  const startMin = Math.max(0, offset - canonical.length + matchLength);
-  const startMax = Math.min(offset, text.length - canonical.length);
+  return canonicalTerms.some((canonical) => {
+    const startMin = Math.max(0, offset - canonical.length + matchLength);
+    const startMax = Math.min(offset, text.length - canonical.length);
 
-  for (let start = startMin; start <= startMax; start++) {
-    if (text.slice(start, start + canonical.length) === canonical) {
-      return true;
+    for (let start = startMin; start <= startMax; start++) {
+      if (text.slice(start, start + canonical.length) === canonical) {
+        return true;
+      }
     }
-  }
 
-  return false;
+    return false;
+  });
 }

@@ -16,6 +16,8 @@ export interface TranscriptEvent {
   confidence?: number;
   language?: LanguageMode;
   providerId: string;
+  candidateId?: string;
+  isLowInformation?: boolean;
   timestampMs: number;
   recoverable?: boolean;
   errorMessage?: string;

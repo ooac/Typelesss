@@ -1,6 +1,7 @@
 import { Keyboard, Save, Settings } from "lucide-react";
 import { useState, type KeyboardEvent } from "react";
 import {
+  autoOptimizedDefaults,
   localHybridDefaults,
   stepfunRealtimeDefaults,
   whisperCompatibleDefaults,
@@ -32,12 +33,25 @@ export function SettingsForm({
   const update = <K extends keyof AppConfig>(key: K, value: AppConfig[K]) =>
     setConfig({ ...config, [key]: value });
   const updateAsrProvider = (provider: AsrProvider) => {
+    if (provider === "auto_optimized") {
+      setConfig({
+        ...config,
+        asrProvider: provider,
+        asrEndpoint: autoOptimizedDefaults.endpoint,
+        asrModel: autoOptimizedDefaults.model,
+        asrProviderCandidates: autoOptimizedDefaults.candidates,
+        asrAutoBenchmarkEnabled: true,
+        asrSaveBenchmarkAudio: true,
+      });
+      return;
+    }
     if (provider === "local_hybrid") {
       setConfig({
         ...config,
         asrProvider: provider,
         asrEndpoint: localHybridDefaults.endpoint,
         asrModel: localHybridDefaults.model,
+        localAsrEngineId: localHybridDefaults.model,
       });
       return;
     }
@@ -94,6 +108,7 @@ export function SettingsForm({
       <label>
         ASR 服务商
         <select value={config.asrProvider} onChange={(event) => updateAsrProvider(event.target.value as AsrProvider)}>
+          <option value="auto_optimized">极速自动 ASR</option>
           <option value="local_hybrid">本地混合 ASR</option>
           <option value="stepfun_streaming">StepFun 实时 ASR</option>
           <option value="whisper_compatible">硅基流动 / Whisper-compatible</option>

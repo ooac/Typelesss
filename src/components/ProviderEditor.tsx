@@ -16,6 +16,7 @@ import { HealthChip } from "./HealthChip.js";
 import { ProviderRow } from "./ProviderRow.js";
 import { SecretField } from "./SecretField.js";
 import {
+  autoOptimizedDefaults,
   localHybridDefaults,
   stepfunRealtimeDefaults,
   whisperCompatibleDefaults,
@@ -25,7 +26,9 @@ import { useApp } from "../state/AppContext.js";
 import type {
   AppConfig,
   AsrProvider,
+  LocalAsrMode,
   LocalAsrDownloadProgress,
+  LocalAsrBenchmarkResult,
   LocalAsrModelStatus,
   LocalAsrStatus,
   PolishProvider,
@@ -45,6 +48,7 @@ type EditorId =
   | "outputMode";
 
 const ASR_PROVIDER_LABEL: Record<AsrProvider, string> = {
+  auto_optimized: "极速自动 ASR",
   local_hybrid: "本地混合 ASR",
   whisper_compatible: "硅基流动 / Whisper-compatible",
   stepfun_streaming: "StepFun 实时 ASR",
@@ -125,12 +129,16 @@ export function ProviderEditor({
   const asrModelPlaceholder =
     draft.asrProvider === "local_hybrid"
       ? localHybridDefaults.model
+      : draft.asrProvider === "auto_optimized"
+        ? autoOptimizedDefaults.model
       : draft.asrProvider === "stepfun_streaming"
         ? stepfunRealtimeDefaults.model
         : "FunAudioLLM/SenseVoiceSmall";
   const asrEndpointPlaceholder =
     draft.asrProvider === "local_hybrid"
       ? localHybridDefaults.endpoint
+      : draft.asrProvider === "auto_optimized"
+      ? autoOptimizedDefaults.endpoint
       : draft.asrProvider === "stepfun_streaming"
       ? stepfunRealtimeDefaults.endpoint
       : "https://api.siliconflow.cn/v1/audio/transcriptions";
@@ -172,18 +180,34 @@ export function ProviderEditor({
     }
   }, [refreshLocalStatus]);
 
+  const openLocalBenchmarkDir = useCallback(async () => {
+    setLocalBusy(true);
+    try {
+      const path = await invoke<string>("open_local_asr_benchmark_dir");
+      setLocalMessage(`已打开评测样本目录：${path}。放入同名 wav/txt 后可运行基线评测。`);
+    } catch (err) {
+      setLocalMessage(`打开评测样本目录失败：${String(err)}`);
+    } finally {
+      setLocalBusy(false);
+    }
+  }, []);
+
   const downloadAndActivateLocalModel = useCallback(
     async (modelId: string, mirror = "huggingface") => {
       setLocalBusy(true);
       setLocalMessage("");
       try {
-        let status = await invoke<LocalAsrStatus>("download_local_asr_model", { modelId, mirror });
+        let status = await invoke<LocalAsrStatus>("download_local_asr_engine", {
+          engineId: modelId,
+          mirror,
+        });
         setLocalStatus(status);
-        status = await invoke<LocalAsrStatus>("activate_local_asr_model", { modelId });
+        status = await invoke<LocalAsrStatus>("activate_local_asr_engine", { engineId: modelId });
         setLocalStatus(status);
         await updateAndSaveConfig({
           asrProvider: "local_hybrid",
           asrModel: modelId,
+          localAsrEngineId: modelId,
           asrEndpoint: "",
         });
         setLocalMessage(`${localModelLabel(modelId)} 已下载并启用。`);
@@ -202,11 +226,14 @@ export function ProviderEditor({
       setLocalBusy(true);
       setLocalMessage("");
       try {
-        const status = await invoke<LocalAsrStatus>("activate_local_asr_model", { modelId });
+        const status = await invoke<LocalAsrStatus>("activate_local_asr_engine", {
+          engineId: modelId,
+        });
         setLocalStatus(status);
         await updateAndSaveConfig({
           asrProvider: "local_hybrid",
           asrModel: modelId,
+          localAsrEngineId: modelId,
           asrEndpoint: "",
         });
         setLocalMessage(`${localModelLabel(modelId)} 已启用。`);
@@ -224,6 +251,34 @@ export function ProviderEditor({
     void refreshLocalStatus();
   }, [refreshLocalStatus]);
 
+  const runLocalBenchmark = useCallback(async () => {
+    setLocalBusy(true);
+    try {
+      const report = await invoke<LocalAsrBenchmarkResult>("run_asr_benchmark");
+      setLocalMessage(`评测框架已生成：${report.summary.note}`);
+      void refreshLocalStatus();
+    } catch (err) {
+      setLocalMessage(`本地评测失败：${String(err)}`);
+    } finally {
+      setLocalBusy(false);
+    }
+  }, [refreshLocalStatus]);
+
+  const updateLocalMode = useCallback(
+    async (mode: LocalAsrMode) => {
+      await updateAndSaveConfig({ localAsrMode: mode });
+      void refreshLocalStatus();
+    },
+    [refreshLocalStatus, updateAndSaveConfig],
+  );
+
+  const updateLiveInsert = useCallback(
+    async (enabled: boolean) => {
+      await updateAndSaveConfig({ liveInsertEnabled: enabled });
+    },
+    [updateAndSaveConfig],
+  );
+
   const renderInlineEditor = (id: EditorId) => {
     if (editing !== id) return null;
     return (
@@ -233,6 +288,7 @@ export function ProviderEditor({
             label="ASR 服务商"
             value={draft.asrProvider}
             options={[
+              { value: "auto_optimized", label: ASR_PROVIDER_LABEL.auto_optimized },
               { value: "local_hybrid", label: ASR_PROVIDER_LABEL.local_hybrid },
               { value: "stepfun_streaming", label: ASR_PROVIDER_LABEL.stepfun_streaming },
               { value: "whisper_compatible", label: ASR_PROVIDER_LABEL.whisper_compatible },
@@ -240,12 +296,25 @@ export function ProviderEditor({
             ]}
             onChange={(value) => {
               const provider = value as AsrProvider;
+              if (provider === "auto_optimized") {
+                setDraft({
+                  ...draft,
+                  asrProvider: provider,
+                  asrEndpoint: autoOptimizedDefaults.endpoint,
+                  asrModel: autoOptimizedDefaults.model,
+                  asrProviderCandidates: autoOptimizedDefaults.candidates,
+                  asrAutoBenchmarkEnabled: true,
+                  asrSaveBenchmarkAudio: true,
+                });
+                return;
+              }
               if (provider === "local_hybrid") {
                 setDraft({
                   ...draft,
                   asrProvider: provider,
                   asrEndpoint: localHybridDefaults.endpoint,
                   asrModel: localHybridDefaults.model,
+                  localAsrEngineId: localHybridDefaults.model,
                 });
                 return;
               }
@@ -423,9 +492,16 @@ export function ProviderEditor({
               status={localStatus}
               onRefresh={refreshLocalStatus}
               onOpenDir={openLocalModelsDir}
+              onOpenBenchmarkDir={openLocalBenchmarkDir}
               onDownload={downloadAndActivateLocalModel}
               onActivate={activateLocalModel}
               onCancel={cancelLocalDownload}
+              onBenchmark={runLocalBenchmark}
+              mode={config.localAsrMode}
+              liveInsertEnabled={config.liveInsertEnabled}
+              autoInsertEnabled={config.autoInsert}
+              onModeChange={updateLocalMode}
+              onLiveInsertChange={updateLiveInsert}
             />
           ) : (
             <>
@@ -547,51 +623,113 @@ function LocalAsrCard({
   progress,
   busy,
   message,
+  mode,
+  liveInsertEnabled,
+  autoInsertEnabled,
   onRefresh,
   onOpenDir,
+  onOpenBenchmarkDir,
   onDownload,
   onActivate,
   onCancel,
+  onBenchmark,
+  onModeChange,
+  onLiveInsertChange,
 }: {
   status: LocalAsrStatus | null;
   progress: Record<string, LocalAsrDownloadProgress>;
   busy: boolean;
   message: string;
+  mode: LocalAsrMode;
+  liveInsertEnabled: boolean;
+  autoInsertEnabled: boolean;
   onRefresh: () => void | Promise<void>;
   onOpenDir: () => void | Promise<void>;
+  onOpenBenchmarkDir: () => void | Promise<void>;
   onDownload: (modelId: string, mirror?: string) => void | Promise<void>;
   onActivate: (modelId: string) => void | Promise<void>;
   onCancel: (modelId: string) => void | Promise<void>;
+  onBenchmark: () => void | Promise<void>;
+  onModeChange: (mode: LocalAsrMode) => void | Promise<void>;
+  onLiveInsertChange: (enabled: boolean) => void | Promise<void>;
 }) {
   const models = normalizeLocalModels(status?.models ?? []);
+  const activeEngine = status?.engines.find((engine) => engine.isActive);
+  const recommendedEngine = status?.engines.find((engine) => engine.id === status?.recommendedEngineId);
+  const isLocalActive = Boolean(status?.installed && status?.activeEngineId);
 
   return (
     <div className="provider-local-asr-card">
       <div className="provider-local-asr-card__header">
         <div>
           <strong>本地模型</strong>
-          <small>下载后自动切换为本地 ASR。模型保存在 App data，不进入 Git。</small>
+        <small>Sherpa-ONNX 本地运行，不需要用户手动配置 endpoint 或启动 runtime。</small>
         </div>
-        <span className={status?.isActive ? "status-chip saved" : "status-chip"}>
-          {status?.isActive ? "已启用" : status?.installed ? "已下载" : "未下载"}
+        <span className={isLocalActive ? "status-chip saved" : "status-chip"}>
+          {isLocalActive ? "已启用" : status?.runtimeInstalled ? "Runtime 就绪" : "未下载"}
         </span>
+      </div>
+
+      <div className="local-asr-control-grid">
+        <SelectField
+          label="本地策略"
+          value={mode}
+          options={[
+            { value: "auto", label: "自动择优" },
+            { value: "fast", label: "平衡极速" },
+            { value: "zh_fast", label: "中文极速" },
+            { value: "accurate", label: "准确率优先" },
+          ]}
+          onChange={(value) => void onModeChange(value as LocalAsrMode)}
+        />
+        <label className="local-asr-toggle-row">
+          <span>
+            <strong>边说边插入</strong>
+            <small>
+              {autoInsertEnabled
+                ? "实验功能：支持的输入框会 stable 插入，final 原地替换。"
+                : "需要先开启自动粘贴。"}
+            </small>
+          </span>
+          <span className="switch">
+            <input
+              type="checkbox"
+              checked={liveInsertEnabled && autoInsertEnabled}
+              disabled={!autoInsertEnabled}
+              onChange={(event) => void onLiveInsertChange(event.target.checked)}
+            />
+            <span />
+          </span>
+        </label>
+      </div>
+
+      <div className="local-engine-summary">
+        <span>当前：{activeEngine?.displayName ?? localModelLabel(status?.activeEngineId ?? "")}</span>
+        <span>推荐：{recommendedEngine?.displayName ?? localModelLabel(status?.recommendedEngineId ?? "")}</span>
+        {status?.benchmarkSummary ? (
+          <span>Benchmark：{status.benchmarkSummary.note}</span>
+        ) : null}
       </div>
 
       <div className="local-model-list">
         {models.map((model) => {
           const eventProgress = progress[model.id];
-          const phase = eventProgress?.phase || model.downloadPhase;
+          const phase = eventProgress?.phase || "idle";
           const percent =
             eventProgress && eventProgress.bytesTotal > 0
               ? Math.round((eventProgress.bytesDownloaded / eventProgress.bytesTotal) * 100)
-              : model.downloadProgress;
+              : model.totalBytes && model.totalBytes > 0
+                ? Math.round((model.downloadBytes / model.totalBytes) * 100)
+                : 0;
           const downloading =
-            phase === "downloading" ||
+            phase === "downloading-model" ||
+            phase === "downloading-runtime" ||
+            phase === "extracting-runtime" ||
             phase === "started" ||
             phase === "progress" ||
             phase === "installing-runtime";
-          const label = model.id === "qwen3-asr-1.7b" ? "高准确率模型" : "默认极速模型";
-          const primary = model.id === "qwen3-asr-0.6b";
+          const label = localModelBadge(model.id);
+          const primary = model.id === "sensevoice-small";
 
           return (
             <div key={model.id} className={model.isActive ? "local-model-card is-active" : "local-model-card"}>
@@ -604,8 +742,10 @@ function LocalAsrCard({
                     : model.isDownloaded
                       ? "已下载，可直接启用。"
                       : primary
-                        ? "推荐默认下载，体积和准确率更均衡。"
-                        : "更高准确率，体积更大，按需下载。"}
+                        ? "推荐默认下载，小巧、启动快，适合中文、英文和中英混输。"
+                        : model.id === "funasr-paraformer-zh-small"
+                          ? "中文短句更快，英文能力弱于 SenseVoice。"
+                          : "更强上下文，体积更大，适合长句和复杂术语。"}
                 </small>
                 {downloading ? (
                   <div className="local-model-progress" aria-label={`${percent}%`}>
@@ -615,10 +755,12 @@ function LocalAsrCard({
                 <small className="local-model-card__meta">
                   {downloading
                     ? phase === "installing-runtime"
+                      || phase === "downloading-runtime"
+                      || phase === "extracting-runtime"
                       ? "正在安装本地识别引擎"
                       : `下载中 ${percent}%`
-                    : model.totalBytes > 0
-                      ? `${formatBytes(model.downloadedBytes)} / ${formatBytes(model.totalBytes)}`
+                    : model.totalBytes && model.totalBytes > 0
+                      ? `${formatBytes(model.downloadBytes)} / ${formatBytes(model.totalBytes)}`
                       : model.isDownloaded
                         ? "模型文件已就绪"
                         : "等待下载"}
@@ -651,7 +793,11 @@ function LocalAsrCard({
                       disabled={busy}
                       onClick={() => void onDownload(model.id, "huggingface")}
                     >
-                      {primary ? "下载并启用" : "下载高准确率模型"}
+                      {primary
+                        ? "下载并启用"
+                        : model.id === "funasr-paraformer-zh-small"
+                          ? "下载中文极速模型"
+                          : "下载高准确率模型"}
                     </button>
                     <button
                       type="button"
@@ -678,10 +824,23 @@ function LocalAsrCard({
           <FolderOpen size={14} />
           打开模型目录
         </button>
+        <button type="button" className="ghost compact" disabled={busy} onClick={() => void onBenchmark()}>
+          <AudioLines size={14} />
+          运行基线评测
+        </button>
+        <button
+          type="button"
+          className="ghost compact"
+          disabled={busy}
+          onClick={() => void onOpenBenchmarkDir()}
+        >
+          <FolderOpen size={14} />
+          打开评测目录
+        </button>
       </div>
 
-      {message || status?.message ? (
-        <p className="provider-local-asr-card__message">{message || status?.message}</p>
+      {message ? (
+        <p className="provider-local-asr-card__message">{message}</p>
       ) : null}
     </div>
   );
@@ -690,34 +849,57 @@ function LocalAsrCard({
 function normalizeLocalModels(models: LocalAsrModelStatus[]): LocalAsrModelStatus[] {
   const fallback: LocalAsrModelStatus[] = [
     {
-      id: "qwen3-asr-0.6b",
-      displayName: "Qwen3-ASR-0.6B",
-      hfRepo: "Qwen/Qwen3-ASR-0.6B",
-      downloadedBytes: 0,
-      totalBytes: 0,
+      id: "sensevoice-small",
+      displayName: "SenseVoice Small int8",
+      family: "sherpa_onnx_sensevoice",
+      sizeLabel: "约 350 MB",
+      downloadBytes: 0,
+      totalBytes: null,
       isDownloaded: false,
       isActive: false,
-      downloadPhase: "idle",
-      downloadProgress: 0,
+      path: "",
+      source: "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
     },
     {
-      id: "qwen3-asr-1.7b",
-      displayName: "Qwen3-ASR-1.7B",
-      hfRepo: "Qwen/Qwen3-ASR-1.7B",
-      downloadedBytes: 0,
-      totalBytes: 0,
+      id: "funasr-paraformer-zh-small",
+      displayName: "FunASR Paraformer 中文小模型",
+      family: "sherpa_onnx_funasr",
+      sizeLabel: "约 220 MB",
+      downloadBytes: 0,
+      totalBytes: null,
       isDownloaded: false,
       isActive: false,
-      downloadPhase: "idle",
-      downloadProgress: 0,
+      path: "",
+      source: "csukuangfj/sherpa-onnx-paraformer-zh-small-2024-03-09",
+    },
+    {
+      id: "qwen3-asr-0.6b",
+      displayName: "Qwen3-ASR 0.6B int8",
+      family: "sherpa_onnx_qwen",
+      sizeLabel: "约 1.2 GB",
+      downloadBytes: 0,
+      totalBytes: null,
+      isDownloaded: false,
+      isActive: false,
+      path: "",
+      source: "ModelScope: zengshuishui/Qwen3-ASR-onnx + Qwen/Qwen3-ASR-0.6B",
     },
   ];
   return fallback.map((item) => models.find((model) => model.id === item.id) ?? item);
 }
 
 function localModelLabel(modelId: string): string {
-  if (modelId === "qwen3-asr-1.7b") return "Qwen3-ASR-1.7B";
-  return "Qwen3-ASR-0.6B";
+  if (modelId === "sensevoice-small") return "SenseVoice Small";
+  if (modelId === "funasr-paraformer-zh-small") return "FunASR 中文极速";
+  if (modelId === "qwen3-asr-0.6b") return "Qwen3-ASR 0.6B";
+  return modelId || "SenseVoice Small";
+}
+
+function localModelBadge(modelId: string): string {
+  if (modelId === "sensevoice-small") return "默认极速模型";
+  if (modelId === "funasr-paraformer-zh-small") return "中文极速模型";
+  if (modelId === "qwen3-asr-0.6b") return "高准确率模型";
+  return "本地模型";
 }
 
 function formatBytes(bytes: number): string {

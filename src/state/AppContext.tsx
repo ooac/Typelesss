@@ -8,9 +8,11 @@ import {
   useMemo,
   useRef,
   useState,
+  type Dispatch,
   type ReactNode,
+  type SetStateAction,
 } from "react";
-import { defaultConfig, fallbackHotkey, normalizeAsrProviderConfig } from "../appDefaults.js";
+import { defaultConfig, mergeLoadedConfig, normalizeAsrProviderConfig } from "../appDefaults.js";
 import type {
   AppConfig,
   CapsulePayload,
@@ -20,10 +22,18 @@ import type {
 } from "../appTypes.js";
 import type { DictionaryEntry } from "../dictionary/builtin.js";
 import {
+  inferReadbackCorrection,
+  inferSelectedTextCorrection,
+  isSafeLearnedCorrection,
+} from "../correction/learnedCorrection.js";
+import {
+  insertCorrectionPair,
   insertSession,
   learnPersonalTermsFromText,
+  listCorrectionPairs,
   listPersonalTerms,
   recordAsrTelemetry,
+  upsertPersonalTerm,
 } from "../db/historyRepo.js";
 import { formatHotkey } from "../hotkey.js";
 import { normalizeFast, validatePolishOutput } from "../index.js";
@@ -60,6 +70,7 @@ interface AppContextValue {
   startRecording: () => Promise<void>;
   stopAndProcess: () => Promise<void>;
   cancelRecording: () => Promise<void>;
+  learnSelectedText: () => Promise<void>;
   clearTranscript: () => void;
   setIsHotkeyCapture: (capturing: boolean) => void;
 }
@@ -69,6 +80,7 @@ interface ShortcutTogglePayload {
 }
 
 const REALTIME_ASR_PROVIDERS = new Set<AppConfig["asrProvider"]>([
+  "auto_optimized",
   "stepfun_streaming",
 ]);
 const REALTIME_TERMS = [
@@ -92,6 +104,25 @@ interface SessionTelemetryDraft {
   stableInsertAt: number | null;
   finalReceivedAt: number | null;
   insertDoneAt: number | null;
+}
+
+interface ReadbackResult {
+  sessionId: string;
+  targetApp: string;
+  insertedText: string;
+  editedText: string;
+  readText: string;
+  learned: boolean;
+  reason: string;
+}
+
+interface LearnSelectedTextResult {
+  selectedText: string;
+  targetApp: string;
+  matchedSessionId?: string | null;
+  insertedText: string;
+  learned: boolean;
+  reason: string;
 }
 
 const AppCtx = createContext<AppContextValue | null>(null);
@@ -122,7 +153,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const streamingFinalRef = useRef("");
   const streamingErrorRef = useRef("");
   const streamingFinalWaitersRef = useRef<Array<(text: string) => void>>([]);
+  const compositionSessionRef = useRef<string | null>(null);
+  const liveStableTextRef = useRef("");
+  const liveInsertFailedRef = useRef(false);
   const personalTermsRef = useRef<string[]>([]);
+  const correctionEntriesRef = useRef<DictionaryEntry[]>([]);
   const sessionTelemetryRef = useRef<SessionTelemetryDraft | null>(null);
   /**
    * Tracks which preset is driving the *current* recording session so that
@@ -160,7 +195,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     );
   }, []);
 
-  // load_config + Right Option migration
+  // load_config must never rewrite the user's shortcut. Registration errors are surfaced,
+  // but the configured hotkey remains the single source of truth.
   useEffect(() => {
     if (!isTauriRuntime) {
       setStatus("浏览器预览模式：原生录音和系统授权需在 Typelesss App 内使用。");
@@ -168,7 +204,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
     invoke<AppConfig>("load_config")
       .then((loaded) => {
-        const mergedConfig = { ...defaultConfig, ...loaded };
+        const mergedConfig = mergeLoadedConfig(loaded);
         const loadedConfig = normalizeAsrProviderConfig(mergedConfig);
         setConfig(loadedConfig);
         sessionPresetIdRef.current = loadedConfig.activePresetId || loadedConfig.presets[0]?.id || "default";
@@ -180,23 +216,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
             console.warn("normalize asr provider config failed:", err);
           });
         }
-        if (loadedConfig.hotkey === "RightOption") {
-          return invoke<string>("save_config", { config: loadedConfig })
-            .then(() => setStatus("Right Option 已保存。若你刚打开输入监控权限，请重启 App 后再按右 Option。"))
-            .catch(async (err) => {
-              const fallbackConfig = { ...loadedConfig, hotkey: fallbackHotkey };
-              try {
-                const registeredHotkey = await invoke<string>("save_config", { config: fallbackConfig });
-                setConfig({ ...fallbackConfig, hotkey: registeredHotkey });
-                setError(`Right Option 未启用：${String(err)}`);
-                setStatus(
-                  `已临时启用 ${formatHotkey(registeredHotkey)}。完成输入监控授权后可再改回 Right Option。`,
-                );
-              } catch (fallbackErr) {
-                setError(`${String(err)}；备用快捷键也注册失败：${String(fallbackErr)}`);
-                setStatus("快捷键未启用，请先完成输入监控授权或改用其他快捷键。");
-              }
-            });
+        const activeHotkey =
+          loadedConfig.presets.find((preset) => preset.id === loadedConfig.activePresetId)?.hotkey ??
+          loadedConfig.hotkey;
+        if (activeHotkey === "RightOption") {
+          setStatus("Right Option 已保留。若未生效，请先完成输入监控授权或重启 App。");
         }
         return undefined;
       })
@@ -211,9 +235,17 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (!isTauriRuntime) return;
-    void listPersonalTerms()
-      .then((terms) => {
+    void Promise.all([listPersonalTerms(), listCorrectionPairs()])
+      .then(([terms, corrections]) => {
         personalTermsRef.current = terms.map((term) => term.canonical);
+        correctionEntriesRef.current = corrections
+          .filter((pair) => isSafeLearnedCorrection(pair.beforeText, pair.afterText))
+          .map((pair) => ({
+            canonical: pair.afterText,
+            aliases: [pair.beforeText],
+            category: "coding",
+            language: /[\u3400-\u9fff]/u.test(pair.afterText) ? "mixed" : "en",
+          }));
         realtimeStabilizerRef.current = new TranscriptStabilizer({
           dictionaryTerms: [...REALTIME_TERMS, ...personalTermsRef.current],
         });
@@ -226,6 +258,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const unlisten = listen<TranscriptEvent>("transcript-event", (event) => {
       const payload = event.payload;
       if (!payload) return;
+      if (payload.kind !== "error" && payload.isLowInformation) return;
 
       if (payload.kind === "partial") {
         if (!sessionTelemetryRef.current?.firstPartialAt) {
@@ -241,6 +274,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setNormalizedText(output.stableText || previewText);
         setFinalText(previewText);
         setStatus("实时转写中。");
+        if (output.stableText && output.stableText !== liveStableTextRef.current) {
+          void applyLiveComposition(output.stableText, "stable", compositionSessionRef, liveStableTextRef, liveInsertFailedRef, sessionTelemetryRef);
+        }
         return;
       }
 
@@ -253,6 +289,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
         }
         setNormalizedText(payload.text);
         streamingPreviewRef.current = payload.text;
+        if (payload.text && payload.text !== liveStableTextRef.current) {
+          void applyLiveComposition(payload.text, "stable", compositionSessionRef, liveStableTextRef, liveInsertFailedRef, sessionTelemetryRef);
+        }
         return;
       }
 
@@ -278,7 +317,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
         const message = payload.errorMessage || "实时 ASR 失败";
         streamingErrorRef.current = message;
         setError(message);
-        setStatus(`实时 ASR 失败：${message}`);
+        setStatus(
+          configRef.current.asrProvider === "auto_optimized"
+            ? `实时 ASR 失败，停止后会自动切换候选：${message}`
+            : `实时 ASR 失败：${message}`,
+        );
         const waiters = streamingFinalWaitersRef.current.splice(0);
         waiters.forEach((resolve) => resolve(""));
       }
@@ -310,13 +353,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
     try {
       const current = configRef.current;
-      const registeredHotkey = await invoke<string>("save_config", { config: current });
-      setConfig({ ...current, hotkey: registeredHotkey });
+      await invoke<string>("save_config", { config: current });
+      setConfig(current);
       setError("");
-      if (registeredHotkey === "RightOption") {
+      const activeHotkey =
+        current.presets.find((preset) => preset.id === current.activePresetId)?.hotkey ?? current.hotkey;
+      if (activeHotkey === "RightOption") {
         setStatus("Right Option 已保存。若你刚打开输入监控权限，请重启 App 后生效。API key 已写入 macOS Keychain。");
       } else {
-        setStatus(`设置已保存。快捷键已更新为 ${formatHotkey(registeredHotkey)}。API key 已写入 macOS Keychain。`);
+        setStatus(`设置已保存。快捷键保持为 ${formatHotkey(activeHotkey)}。API key 已写入 macOS Keychain。`);
       }
     } catch (err) {
       setError(String(err));
@@ -330,10 +375,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setConfig(next);
       if (!isTauriRuntime) return;
       try {
-        const registeredHotkey = await invoke<string>("save_config", { config: next });
-        if (registeredHotkey !== next.hotkey) {
-          setConfig({ ...next, hotkey: registeredHotkey });
-        }
+        await invoke<string>("save_config", { config: next });
         setError("");
         setStatus("设置已保存。");
       } catch (err) {
@@ -396,6 +438,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     streamingFinalRef.current = "";
     streamingPreviewRef.current = "";
     streamingErrorRef.current = "";
+    compositionSessionRef.current = null;
+    liveStableTextRef.current = "";
+    liveInsertFailedRef.current = false;
     realtimeStabilizerRef.current.reset();
     streamingFinalWaitersRef.current.splice(0).forEach((resolve) => resolve(""));
     sessionTelemetryRef.current = makeTelemetryDraft();
@@ -406,13 +451,26 @@ export function AppProvider({ children }: { children: ReactNode }) {
       (p) => p.id === configRef.current.activePresetId,
     );
     if (active) sessionPresetIdRef.current = active.id;
-    setStatus(REALTIME_ASR_PROVIDERS.has(configRef.current.asrProvider) ? "实时 ASR 已启动，正在监听。" : "录音中，点击停止后会转写并插入。");
+    const supportsRealtimeAsr = REALTIME_ASR_PROVIDERS.has(configRef.current.asrProvider);
+    setStatus(
+      supportsRealtimeAsr
+        ? "实时 ASR 已启动，正在监听。"
+        : "录音中，本地模型会在停止后快速转写并插入。",
+    );
     try {
       await invoke("start_recording", { config: configRef.current });
       sessionTelemetryRef.current = {
         ...(sessionTelemetryRef.current ?? makeTelemetryDraft()),
         firstAudioSentAt: Date.now(),
       };
+      if (supportsRealtimeAsr && configRef.current.liveInsertEnabled && configRef.current.autoInsert) {
+        try {
+          compositionSessionRef.current = await invoke<string>("begin_composition");
+        } catch (err) {
+          console.warn("live composition begin failed, falling back to final paste:", err);
+          liveInsertFailedRef.current = true;
+        }
+      }
     } catch (err) {
       setRuntimeState("error");
       setRecordingStartedAt(null);
@@ -425,6 +483,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (!isTauriRuntime) return;
     setRuntimeState("processing");
     setStatus("正在停止录音。");
+    let recordingForCleanup: RecordingResult | null = null;
     try {
       const activeConfig = configRef.current;
       const sessionPreset =
@@ -438,22 +497,31 @@ export function AppProvider({ children }: { children: ReactNode }) {
         5_000,
         "停止录音",
       );
+      recordingForCleanup = recording;
       let transcript = "";
       if (REALTIME_ASR_PROVIDERS.has(activeConfig.asrProvider)) {
         setStatus("正在等待实时 ASR final。");
         transcript = streamingFinalRef.current || (await waitForStreamingFinal(streamingFinalWaitersRef, streamingFinalRef, 1_500));
-        if (!transcript.trim() && streamingErrorRef.current) {
+        if (!transcript.trim() && streamingErrorRef.current && activeConfig.asrProvider !== "auto_optimized") {
           throw new Error(streamingErrorRef.current);
+        }
+        if (!transcript.trim() && streamingErrorRef.current) {
+          setStatus("实时 ASR 没有可用 final，正在切换自动候选。");
         }
       }
       if (!transcript.trim()) {
-        setStatus("正在上传录音并请求 ASR。");
+        const isLocalAsr = activeConfig.asrProvider === "local_hybrid";
+        const isAutoAsr = activeConfig.asrProvider === "auto_optimized";
+        setStatus(isLocalAsr ? "正在本地模型转写。" : isAutoAsr ? "正在自动选择最快可用 ASR。" : "正在上传录音并请求 ASR。");
+        const asrTimeoutMs = isLocalAsr || isAutoAsr
+          ? Math.min(30_000, Math.max(8_000, Math.ceil(recording.durationMs * 4 + 4_000)))
+          : 30_000;
         transcript = await withTimeout(
           invoke<string>("transcribe_audio", {
             config: activeConfig,
             wavPath: recording.wavPath,
           }),
-          30_000,
+          asrTimeoutMs,
           "ASR",
         );
         sessionTelemetryRef.current = {
@@ -465,12 +533,19 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
       const candidate = normalizeFast(transcript, {
         mode: sessionOutputMode,
-        dictionaryEntries: personalDictionaryEntries(personalTermsRef.current),
+        dictionaryEntries: [
+          ...correctionEntriesRef.current,
+          ...personalDictionaryEntries(personalTermsRef.current),
+        ],
       });
       setNormalizedText(candidate.normalizedText);
 
       let nextFinal = candidate.normalizedText;
-      if (activeConfig.polishProvider !== "disabled" && candidate.shouldUseLlm) {
+      const shouldRemotePolish =
+        activeConfig.polishProvider !== "disabled" &&
+        candidate.shouldUseLlm &&
+        (sessionOutputMode === "prompt_builder" || sessionOutputMode === "code_prompt");
+      if (shouldRemotePolish) {
         setStatus(`ASR 完成，正在调用 polish（${sessionPreset?.label ?? "默认"} 预设）。`);
         try {
           const polished = await withTimeout(
@@ -494,11 +569,38 @@ export function AppProvider({ children }: { children: ReactNode }) {
       let deliveryMessage: string;
       if (activeConfig.autoInsert) {
         setStatus("正在插入当前光标。");
-        deliveryMessage = await withTimeout(
-          invoke<string>("paste_text", { text: nextFinal }),
-          8_000,
-          "插入文本",
-        );
+        if (activeConfig.liveInsertEnabled && compositionSessionRef.current && !liveInsertFailedRef.current) {
+          try {
+            deliveryMessage = await withTimeout(
+              invoke<string>("apply_composition_patch", {
+                sessionId: compositionSessionRef.current,
+                text: nextFinal,
+                kind: "final",
+              }),
+              8_000,
+              "实时替换最终文本",
+            );
+            await invoke("finish_composition", { sessionId: compositionSessionRef.current });
+            compositionSessionRef.current = null;
+          } catch (err) {
+            console.warn("live final replace failed, falling back to final paste:", err);
+            if (compositionSessionRef.current) {
+              await invoke("cancel_composition", { sessionId: compositionSessionRef.current }).catch(() => undefined);
+              compositionSessionRef.current = null;
+            }
+            deliveryMessage = await withTimeout(
+              invoke<string>("paste_text", { text: nextFinal }),
+              8_000,
+              "插入文本",
+            );
+          }
+        } else {
+          deliveryMessage = await withTimeout(
+            invoke<string>("paste_text", { text: nextFinal }),
+            8_000,
+            "插入文本",
+          );
+        }
       } else {
         await withTimeout(invoke("copy_text", { text: nextFinal }), 5_000, "复制文本");
         deliveryMessage = "文本已复制到剪贴板。";
@@ -545,6 +647,18 @@ export function AppProvider({ children }: { children: ReactNode }) {
             }),
             learnPersonalTermsFromText(nextFinal, "session"),
           ]);
+          if (activeConfig.autoInsert) {
+            await invoke("remember_recent_insert_context", {
+              payload: {
+                sessionId: savedSession.id,
+                rawText: transcript,
+                finalText: nextFinal,
+                insertedText: nextFinal,
+                insertedAtMs: Date.now(),
+              },
+            }).catch((err) => console.warn("remember insert context failed:", err));
+            schedulePostInsertReadback(savedSession.id, nextFinal, setHistoryRevision);
+          }
           setHistoryRevision((r) => r + 1);
         } catch (err) {
           console.warn("history insert failed (non-fatal):", err);
@@ -561,12 +675,24 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setError(message);
       setRecordingStartedAt(null);
       setStatus(processingFailureStatus(message));
+    } finally {
+      if (recordingForCleanup?.wavPath) {
+        void invoke("cleanup_recording_file", { wavPath: recordingForCleanup.wavPath }).catch((err) => {
+          console.warn("cleanup recording failed:", err);
+        });
+      }
     }
   }, [isTauriRuntime, setRuntimeState]);
 
   const cancelRecording = useCallback(async () => {
     if (!isTauriRuntime) return;
     await invoke("cancel_recording").catch(() => undefined);
+    if (compositionSessionRef.current) {
+      await invoke("cancel_composition", { sessionId: compositionSessionRef.current }).catch(() => undefined);
+      compositionSessionRef.current = null;
+    }
+    liveStableTextRef.current = "";
+    liveInsertFailedRef.current = false;
     setRecordingStartedAt(null);
     setRuntimeState("idle");
     setStatus("已取消。");
@@ -581,6 +707,45 @@ export function AppProvider({ children }: { children: ReactNode }) {
     streamingErrorRef.current = "";
     realtimeStabilizerRef.current.reset();
   }, []);
+
+  const learnSelectedText = useCallback(async () => {
+    if (!isTauriRuntime) {
+      setStatus("请在 Typelesss App 内使用选中文本学习。");
+      return;
+    }
+    try {
+      const result = await invoke<LearnSelectedTextResult>("learn_selected_text");
+      const selectedText = result.selectedText.trim();
+      if (!selectedText) {
+        setStatus("没有读到选中文本。请先在目标软件里选中修正后的词。");
+        return;
+      }
+      let learnedCorrection = false;
+      const correction = result.matchedSessionId
+        ? inferSelectedTextCorrection(result.insertedText, selectedText)
+        : null;
+      if (result.matchedSessionId && correction) {
+        learnedCorrection = await insertCorrectionPair(
+          result.matchedSessionId,
+          correction.beforeText,
+          correction.afterText,
+          "selected_text",
+        );
+      }
+      if (!learnedCorrection) {
+        await upsertPersonalTerm(selectedText, [], "selected_text");
+      }
+      setHistoryRevision((r) => r + 1);
+      setStatus(
+        learnedCorrection
+          ? `已学习纠错：${correction?.beforeText} → ${correction?.afterText}`
+          : `已学习术语：${selectedText}`,
+      );
+    } catch (err) {
+      setError(String(err));
+      setStatus("学习选中文本失败。");
+    }
+  }, [isTauriRuntime]);
 
   // global hotkey listeners — mounted once, read latest state via refs
   useEffect(() => {
@@ -683,6 +848,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     startRecording,
     stopAndProcess,
     cancelRecording,
+    learnSelectedText,
     clearTranscript,
     setIsHotkeyCapture,
   };
@@ -736,6 +902,67 @@ function waitForStreamingFinal(
       resolve(text);
     };
     waitersRef.current.push(waiter);
+  });
+}
+
+async function applyLiveComposition(
+  text: string,
+  kind: "stable" | "final",
+  sessionRef: { current: string | null },
+  stableRef: { current: string },
+  failedRef: { current: boolean },
+  telemetryRef: { current: SessionTelemetryDraft | null },
+): Promise<void> {
+  if (!sessionRef.current || failedRef.current || !text.trim()) return;
+  try {
+    await invoke<string>("apply_composition_patch", {
+      sessionId: sessionRef.current,
+      text,
+      kind,
+    });
+    stableRef.current = text;
+    if (!telemetryRef.current?.stableInsertAt) {
+      telemetryRef.current = {
+        ...(telemetryRef.current ?? makeTelemetryDraft()),
+        stableInsertAt: Date.now(),
+      };
+    }
+  } catch (err) {
+    console.warn("live composition failed, disabling for this session:", err);
+    failedRef.current = true;
+    if (sessionRef.current) {
+      await invoke("cancel_composition", { sessionId: sessionRef.current }).catch(() => undefined);
+      sessionRef.current = null;
+    }
+  }
+}
+
+function schedulePostInsertReadback(
+  sessionId: string,
+  insertedText: string,
+  bumpHistory: Dispatch<SetStateAction<number>>,
+): void {
+  [2_000, 6_000].forEach((delayMs) => {
+    window.setTimeout(() => {
+      void (async () => {
+        try {
+          const result = await invoke<ReadbackResult>("read_recent_insert_context", {
+            sessionId,
+          });
+          const correction = inferReadbackCorrection(insertedText, result.editedText || result.readText);
+          if (!correction) return;
+          const learned = await insertCorrectionPair(
+            sessionId,
+            correction.beforeText,
+            correction.afterText,
+            "post_insert_readback",
+          );
+          if (learned) bumpHistory((revision) => revision + 1);
+        } catch (err) {
+          console.warn("post insert readback skipped:", err);
+        }
+      })();
+    }, delayMs);
   });
 }
 

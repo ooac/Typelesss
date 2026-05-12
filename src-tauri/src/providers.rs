@@ -4,13 +4,14 @@ use crate::secret_store;
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use reqwest::multipart::{Form, Part};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
     fs,
     io::{Read, Write},
+    path::PathBuf,
     sync::OnceLock,
     time::{Duration, Instant},
 };
@@ -23,6 +24,8 @@ use tokio_tungstenite::{
 
 const ASR_HTTP_TIMEOUT: Duration = Duration::from_secs(25);
 const POLISH_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
+const ALIBABA_PARA_FORMER_ENDPOINT: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference/";
+const ALIBABA_PARA_FORMER_MODEL: &str = "paraformer-realtime-v2";
 const STEPFUN_STREAM_ENDPOINT: &str = "wss://api.stepfun.com/v1/realtime/asr/stream";
 const STEPFUN_STREAM_MODEL: &str = "step-asr-1.1-stream";
 const REALTIME_FINAL_WAIT: Duration = Duration::from_millis(1200);
@@ -31,7 +34,8 @@ static ASR_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 static POLISH_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 pub async fn transcribe_audio(config: &AppConfig, wav_path: &str) -> Result<String> {
-    match config.asr_provider.as_str() {
+    let text = match config.asr_provider.as_str() {
+        "auto_optimized" => transcribe_auto_optimized(config, wav_path).await,
         "whisper_compatible" => transcribe_whisper_compatible(config, wav_path).await,
         "volcengine" => transcribe_volcengine_streaming(config, wav_path).await,
         "local_hybrid" => transcribe_local_hybrid(config, wav_path).await,
@@ -39,7 +43,9 @@ pub async fn transcribe_audio(config: &AppConfig, wav_path: &str) -> Result<Stri
             "StepFun 实时 ASR 未返回 final，不能走 batch 转写。请检查实时连接或切回硅基流动 fallback。"
         )),
         other => Err(anyhow!("未知 ASR Provider：{other}")),
-    }
+    }?;
+    text_is_usable(&text)?;
+    Ok(text)
 }
 
 #[derive(Debug)]
@@ -56,6 +62,10 @@ struct TranscriptEventPayload {
     kind: String,
     text: String,
     provider_id: String,
+    candidate_id: Option<String>,
+    confidence: Option<f32>,
+    is_low_information: Option<bool>,
+    language: Option<String>,
     timestamp_ms: u64,
     recoverable: Option<bool>,
     error_message: Option<String>,
@@ -66,6 +76,14 @@ pub fn start_realtime_asr(
     config: &AppConfig,
 ) -> Result<Option<UnboundedSender<RealtimeAsrCommand>>> {
     match config.asr_provider.as_str() {
+        "auto_optimized" => {
+            let api_key = secret_store::resolve_asr_api_key(&config.asr_api_key);
+            if api_key.trim().is_empty() {
+                Ok(None)
+            } else {
+                start_alibaba_paraformer_realtime_asr(app.clone(), config).map(Some)
+            }
+        }
         "stepfun_streaming" => start_stepfun_realtime_asr(app.clone(), config).map(Some),
         "local_hybrid" => Ok(None),
         _ => Ok(None),
@@ -229,8 +247,289 @@ fn start_stepfun_realtime_asr(
     Ok(tx)
 }
 
+fn start_alibaba_paraformer_realtime_asr(
+    app: AppHandle,
+    config: &AppConfig,
+) -> Result<UnboundedSender<RealtimeAsrCommand>> {
+    let api_key = secret_store::resolve_asr_api_key(&config.asr_api_key);
+    if api_key.trim().is_empty() {
+        return Err(anyhow!("请先填写阿里 Paraformer ASR API Key"));
+    }
+
+    let endpoint = alibaba_realtime_endpoint_or_default(&config.asr_endpoint);
+    let model = if config.asr_model.trim().is_empty() {
+        ALIBABA_PARA_FORMER_MODEL.to_string()
+    } else {
+        config.asr_model.trim().to_string()
+    };
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let provider_id = "alibaba_paraformer_realtime".to_string();
+    let (tx, mut rx) = mpsc::unbounded_channel::<RealtimeAsrCommand>();
+
+    tauri::async_runtime::spawn(async move {
+        let result: Result<()> = async {
+            let mut request = endpoint
+                .into_client_request()
+                .context("无法创建阿里 Paraformer WebSocket 请求")?;
+            request
+                .headers_mut()
+                .insert("Authorization", format!("bearer {}", api_key.trim()).parse()?);
+
+            let (mut ws, _) = connect_async(request)
+                .await
+                .context("无法连接阿里 Paraformer 实时 ASR")?;
+
+            let run_task = json!({
+                "header": {
+                    "action": "run-task",
+                    "task_id": task_id,
+                    "streaming": "duplex"
+                },
+                "payload": {
+                    "task_group": "audio",
+                    "task": "asr",
+                    "function": "recognition",
+                    "model": model,
+                    "parameters": {
+                        "format": "pcm",
+                        "sample_rate": 16000,
+                        "disfluency_removal_enabled": false,
+                        "language_hints": ["zh", "en"]
+                    },
+                    "input": {}
+                }
+            });
+            ws.send(Message::Text(run_task.to_string().into()))
+                .await
+                .context("发送阿里 Paraformer run-task 失败")?;
+
+            let mut task_started = false;
+            let mut finish_requested = false;
+            let mut pending_chunks: Vec<Vec<i16>> = Vec::new();
+            let mut best_text = String::new();
+            let mut committed_at: Option<Instant> = None;
+
+            loop {
+                let final_timeout = committed_at
+                    .map(|at| REALTIME_FINAL_WAIT.saturating_sub(at.elapsed()))
+                    .unwrap_or(Duration::from_secs(3600));
+
+                tokio::select! {
+                    command = rx.recv() => {
+                        match command {
+                            Some(RealtimeAsrCommand::Audio(samples)) => {
+                                if task_started && !finish_requested {
+                                    let audio = pcm_i16_to_le_bytes(&samples);
+                                    ws.send(Message::Binary(audio.into()))
+                                        .await
+                                        .context("发送阿里 Paraformer 音频分片失败")?;
+                                } else if !finish_requested {
+                                    pending_chunks.push(samples);
+                                }
+                            }
+                            Some(RealtimeAsrCommand::Commit) => {
+                                finish_requested = true;
+                                if task_started {
+                                    for chunk in pending_chunks.drain(..) {
+                                        let audio = pcm_i16_to_le_bytes(&chunk);
+                                        ws.send(Message::Binary(audio.into()))
+                                            .await
+                                            .context("发送阿里 Paraformer 缓存音频失败")?;
+                                    }
+                                    committed_at = Some(Instant::now());
+                                    send_alibaba_finish_task(&mut ws, &task_id).await?;
+                                }
+                            }
+                            Some(RealtimeAsrCommand::Cancel) => {
+                                let _ = ws.close(None).await;
+                                break;
+                            }
+                            None => {
+                                if !finish_requested {
+                                    let _ = ws.close(None).await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    message = ws.next() => {
+                        match message {
+                            Some(Ok(Message::Text(text))) => {
+                                if handle_alibaba_message(
+                                    &app,
+                                    &session_id,
+                                    &provider_id,
+                                    &text,
+                                    &mut best_text,
+                                    &mut task_started,
+                                )? {
+                                    break;
+                                }
+                                if task_started && !pending_chunks.is_empty() {
+                                    for chunk in pending_chunks.drain(..) {
+                                        let audio = pcm_i16_to_le_bytes(&chunk);
+                                        ws.send(Message::Binary(audio.into()))
+                                            .await
+                                            .context("发送阿里 Paraformer 缓存音频失败")?;
+                                    }
+                                    if finish_requested && committed_at.is_none() {
+                                        committed_at = Some(Instant::now());
+                                        send_alibaba_finish_task(&mut ws, &task_id).await?;
+                                    }
+                                }
+                            }
+                            Some(Ok(Message::Binary(bytes))) => {
+                                if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                                    if handle_alibaba_message(
+                                        &app,
+                                        &session_id,
+                                        &provider_id,
+                                        &text,
+                                        &mut best_text,
+                                        &mut task_started,
+                                    )? {
+                                        break;
+                                    }
+                                }
+                            }
+                            Some(Ok(Message::Close(_))) | None => {
+                                emit_best_text_as_final(&app, &session_id, &provider_id, &best_text);
+                                break;
+                            }
+                            Some(Ok(_)) => {}
+                            Some(Err(err)) => return Err(anyhow!("读取阿里 Paraformer 响应失败：{err}")),
+                        }
+                    }
+                    _ = tokio::time::sleep(final_timeout), if committed_at.is_some() => {
+                        emit_best_text_as_final(&app, &session_id, &provider_id, &best_text);
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = result {
+            emit_transcript_event(
+                &app,
+                &session_id,
+                "error",
+                "",
+                &provider_id,
+                Some(true),
+                Some(&err.to_string()),
+            );
+        }
+    });
+
+    Ok(tx)
+}
+
+async fn send_alibaba_finish_task<S>(ws: &mut S, task_id: &str) -> Result<()>
+where
+    S: Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let finish_task = json!({
+        "header": {
+            "action": "finish-task",
+            "task_id": task_id,
+            "streaming": "duplex"
+        },
+        "payload": {
+            "input": {}
+        }
+    });
+    ws.send(Message::Text(finish_task.to_string().into()))
+        .await
+        .context("发送阿里 Paraformer finish-task 失败")
+}
+
+fn handle_alibaba_message(
+    app: &AppHandle,
+    session_id: &str,
+    provider_id: &str,
+    text: &str,
+    best_text: &mut String,
+    task_started: &mut bool,
+) -> Result<bool> {
+    let value: Value = serde_json::from_str(text).context("阿里 Paraformer 响应不是合法 JSON")?;
+    let event = value
+        .pointer("/header/event")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match event {
+        "task-started" => {
+            *task_started = true;
+            Ok(false)
+        }
+        "result-generated" => {
+            let sentence = value.pointer("/payload/output/sentence");
+            let transcript = sentence
+                .and_then(|sentence| sentence.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if transcript.trim().is_empty() {
+                return Ok(false);
+            }
+            if text_is_usable(transcript).is_err() {
+                return Ok(false);
+            }
+            *best_text = transcript.trim().to_string();
+            let end_time = sentence
+                .and_then(|sentence| sentence.get("end_time").or_else(|| sentence.get("endTime")));
+            let sentence_end = sentence
+                .and_then(|sentence| sentence.get("sentence_end"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let kind = if end_time.is_some_and(|value| !value.is_null()) || sentence_end {
+                "stable"
+            } else {
+                "partial"
+            };
+            emit_transcript_event(app, session_id, kind, best_text, provider_id, None, None);
+            Ok(false)
+        }
+        "task-finished" => {
+            emit_best_text_as_final(app, session_id, provider_id, best_text);
+            Ok(true)
+        }
+        "task-failed" => {
+            let message = value
+                .pointer("/header/error_message")
+                .and_then(Value::as_str)
+                .unwrap_or("阿里 Paraformer 实时 ASR 返回错误");
+            emit_transcript_event(
+                app,
+                session_id,
+                "error",
+                "",
+                provider_id,
+                Some(true),
+                Some(message),
+            );
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 fn emit_best_text_as_final(app: &AppHandle, session_id: &str, provider_id: &str, best_text: &str) {
     if best_text.trim().is_empty() {
+        return;
+    }
+    if let Err(err) = text_is_usable(best_text) {
+        emit_transcript_event(
+            app,
+            session_id,
+            "error",
+            "",
+            provider_id,
+            Some(true),
+            Some(&err.to_string()),
+        );
         return;
     }
     emit_transcript_event(
@@ -262,6 +561,9 @@ fn handle_stepfun_message(
                 let next_text = merge_stepfun_delta(best_text, delta);
                 if !next_text.trim().is_empty() {
                     *best_text = next_text;
+                    if text_is_usable(best_text).is_err() {
+                        return Ok(false);
+                    }
                     emit_transcript_event(
                         app,
                         session_id,
@@ -283,6 +585,18 @@ fn handle_stepfun_message(
                 .unwrap_or(best_text.as_str())
                 .to_string();
             if !transcript.trim().is_empty() {
+                if let Err(err) = text_is_usable(&transcript) {
+                    emit_transcript_event(
+                        app,
+                        session_id,
+                        "error",
+                        "",
+                        provider_id,
+                        Some(true),
+                        Some(&err.to_string()),
+                    );
+                    return Ok(true);
+                }
                 *best_text = transcript.clone();
                 emit_transcript_event(
                     app,
@@ -345,6 +659,10 @@ fn emit_transcript_event(
             kind: kind.to_string(),
             text: text.to_string(),
             provider_id: provider_id.to_string(),
+            candidate_id: Some(provider_id.to_string()),
+            confidence: None,
+            is_low_information: Some(is_low_information_text(text)),
+            language: Some(detect_transcript_language(text).to_string()),
             timestamp_ms: current_timestamp_ms(),
             recoverable,
             error_message: error_message.map(str::to_string),
@@ -376,8 +694,94 @@ fn realtime_endpoint_or_default(endpoint: &str) -> String {
     }
 }
 
+fn alibaba_realtime_endpoint_or_default(endpoint: &str) -> String {
+    let trimmed = endpoint.trim();
+    if trimmed.starts_with("wss://") || trimmed.starts_with("ws://") {
+        trimmed.to_string()
+    } else {
+        ALIBABA_PARA_FORMER_ENDPOINT.to_string()
+    }
+}
+
 fn asr_hotword_prompt() -> &'static str {
-    "请准确识别中英混输和编程术语：Claude Code、OpenAI Codex、Tauri、src-tauri、TranscriptEvent、ShadowBuffer、WebSocket、TypeScript、Rust、React、Vite。"
+    "只识别并输出中文、英文和中英混输文本。禁止输出日语、平假名、片假名或其他语言。请准确保留编程术语：Claude Code、OpenAI Codex、Tauri、src-tauri、TranscriptEvent、ShadowBuffer、WebSocket、TypeScript、Rust、React、Vite、GPT。"
+}
+
+async fn transcribe_auto_optimized(config: &AppConfig, wav_path: &str) -> Result<String> {
+    let mut errors = Vec::new();
+    for candidate in auto_asr_candidates(config) {
+        let result = match candidate.as_str() {
+            "volcengine" => transcribe_volcengine_streaming(config, wav_path).await,
+            "local_hybrid" => transcribe_local_hybrid(config, wav_path).await,
+            "whisper_compatible" => transcribe_whisper_fallback(config, wav_path).await,
+            "alibaba_paraformer_realtime" => Err(anyhow!(
+                "阿里 Paraformer realtime 未返回 final，停止后跳过 batch 重试"
+            )),
+            _ => Err(anyhow!("未知自动 ASR 候选：{candidate}")),
+        };
+        match result.and_then(|text| validate_candidate_text(&candidate, text)) {
+            Ok(text) => return Ok(text),
+            Err(err) => errors.push(format!("{candidate}: {err}")),
+        }
+    }
+    Err(anyhow!("自动 ASR 候选全部失败：{}", errors.join("；")))
+}
+
+async fn transcribe_whisper_fallback(config: &AppConfig, wav_path: &str) -> Result<String> {
+    let mut fallback = config.clone();
+    if fallback.asr_endpoint.trim().is_empty()
+        || fallback.asr_endpoint.trim().starts_with("ws://")
+        || fallback.asr_endpoint.trim().starts_with("wss://")
+    {
+        fallback.asr_endpoint = "https://api.siliconflow.cn/v1/audio/transcriptions".to_string();
+    }
+    if fallback.asr_model.trim().is_empty()
+        || fallback.asr_model.trim() == ALIBABA_PARA_FORMER_MODEL
+    {
+        fallback.asr_model = "FunAudioLLM/SenseVoiceSmall".to_string();
+    }
+    transcribe_whisper_compatible(&fallback, wav_path).await
+}
+
+fn auto_asr_candidates(config: &AppConfig) -> Vec<String> {
+    let configured = config
+        .asr_provider_candidates
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut candidates = if configured.is_empty() {
+        vec![
+            "alibaba_paraformer_realtime".to_string(),
+            "volcengine".to_string(),
+            "local_hybrid".to_string(),
+            "whisper_compatible".to_string(),
+        ]
+    } else {
+        configured
+    };
+    candidates.retain(|candidate| {
+        if candidate == "volcengine" {
+            !config.volcengine_app_id.trim().is_empty()
+                && !config.volcengine_resource_id.trim().is_empty()
+                && !secret_store::resolve_volcengine_access_token(&config.volcengine_access_token)
+                    .trim()
+                    .is_empty()
+        } else if candidate == "whisper_compatible" {
+            !secret_store::resolve_asr_api_key(&config.asr_api_key)
+                .trim()
+                .is_empty()
+        } else {
+            true
+        }
+    });
+    candidates
+}
+
+fn validate_candidate_text(candidate: &str, text: String) -> Result<String> {
+    text_is_usable(&text).with_context(|| format!("{candidate} 返回不可用文本"))?;
+    Ok(text.trim().to_string())
 }
 
 async fn transcribe_whisper_compatible(config: &AppConfig, wav_path: &str) -> Result<String> {
@@ -444,7 +848,8 @@ async fn transcribe_whisper_compatible(config: &AppConfig, wav_path: &str) -> Re
 }
 
 async fn transcribe_local_hybrid(config: &AppConfig, wav_path: &str) -> Result<String> {
-    local_asr::transcribe_wav(config, wav_path).await
+    let _ = config;
+    local_asr::transcribe_wav(PathBuf::from(wav_path)).await
 }
 
 async fn transcribe_volcengine_streaming(config: &AppConfig, wav_path: &str) -> Result<String> {
@@ -817,6 +1222,73 @@ fn polish_system_prompt(mode: &str) -> &'static str {
     }
 }
 
+fn ensure_supported_transcript_language(text: &str) -> Result<()> {
+    let unsupported_count = text
+        .chars()
+        .filter(|ch| is_japanese_kana(*ch) || is_hangul(*ch))
+        .count();
+    if unsupported_count == 0 {
+        return Ok(());
+    }
+    let meaningful_count = text
+        .chars()
+        .filter(|ch| ch.is_alphanumeric() || is_cjk(*ch) || is_japanese_kana(*ch) || is_hangul(*ch))
+        .count()
+        .max(1);
+    let unsupported_ratio = unsupported_count as f64 / meaningful_count as f64;
+    if unsupported_count >= 2 && unsupported_ratio >= 0.12 {
+        return Err(anyhow!(
+            "ASR 输出疑似非中英文本，已阻止自动插入。当前只支持中文、英文和中英混输，请重试或切换硅基流动引擎。"
+        ));
+    }
+    Ok(())
+}
+
+fn text_is_usable(text: &str) -> Result<()> {
+    ensure_supported_transcript_language(text)?;
+    if is_low_information_text(text) {
+        return Err(anyhow!("ASR 只返回低信息文本，已阻止自动插入"));
+    }
+    Ok(())
+}
+
+fn is_low_information_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let meaningful = trimmed
+        .chars()
+        .filter(|ch| ch.is_alphanumeric() || is_cjk(*ch))
+        .count();
+    meaningful == 0 || (meaningful == 1 && trimmed.chars().count() <= 2)
+}
+
+fn detect_transcript_language(text: &str) -> &'static str {
+    let has_cjk = text.chars().any(is_cjk);
+    let has_ascii = text.chars().any(|ch| ch.is_ascii_alphabetic());
+    match (has_cjk, has_ascii) {
+        (true, true) => "mixed",
+        (true, false) => "zh",
+        (false, true) => "en",
+        _ => "auto",
+    }
+}
+
+fn is_japanese_kana(ch: char) -> bool {
+    ('\u{3040}'..='\u{30ff}').contains(&ch) || ('\u{31f0}'..='\u{31ff}').contains(&ch)
+}
+
+fn is_hangul(ch: char) -> bool {
+    ('\u{1100}'..='\u{11ff}').contains(&ch)
+        || ('\u{3130}'..='\u{318f}').contains(&ch)
+        || ('\u{ac00}'..='\u{d7af}').contains(&ch)
+}
+
+fn is_cjk(ch: char) -> bool {
+    ('\u{3400}'..='\u{9fff}').contains(&ch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,6 +1316,32 @@ mod tests {
     fn detects_empty_top_level_text() {
         let value = json!({ "text": "   " });
         assert!(has_empty_top_level_text(&value));
+    }
+
+    #[test]
+    fn rejects_japanese_kana_transcript() {
+        assert!(ensure_supported_transcript_language("このクラウド？ 我要用ク的 GPT。").is_err());
+        assert!(ensure_supported_transcript_language("我要用 Claude Code 和 GPT。").is_ok());
+    }
+
+    #[test]
+    fn rejects_hangul_transcript() {
+        assert!(ensure_supported_transcript_language("달 많아 달 많아.").is_err());
+        assert!(ensure_supported_transcript_language("太慢了，太慢了。").is_ok());
+    }
+
+    #[test]
+    fn rejects_low_information_transcript() {
+        assert!(text_is_usable("。").is_err());
+        assert!(text_is_usable("").is_err());
+        assert!(text_is_usable("能不能再快一点").is_ok());
+    }
+
+    #[test]
+    fn detects_mixed_transcript_language() {
+        assert_eq!(detect_transcript_language("我要使用 Claude Code"), "mixed");
+        assert_eq!(detect_transcript_language("能不能再快一点"), "zh");
+        assert_eq!(detect_transcript_language("Claude Code"), "en");
     }
 
     #[test]

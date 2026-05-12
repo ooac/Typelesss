@@ -71,11 +71,33 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub async fn probe_asr(config: &AppConfig) -> ProbeResult {
     match config.asr_provider.as_str() {
+        "auto_optimized" => probe_auto_optimized(config).await,
         "whisper_compatible" => probe_whisper_compatible(config).await,
         "volcengine" => probe_volcengine(config),
         "stepfun_streaming" => probe_stepfun_streaming(config),
         "local_hybrid" => probe_local_hybrid(config).await,
         other => ProbeResult::unknown(&format!("未知 ASR Provider：{other}")),
+    }
+}
+
+async fn probe_auto_optimized(config: &AppConfig) -> ProbeResult {
+    let started = Instant::now();
+    let api_key = secret_store::resolve_asr_api_key(&config.asr_api_key);
+    if !api_key.trim().is_empty() {
+        return ProbeResult::unknown(
+            "极速自动 ASR 会在录音时验证阿里 Paraformer，并在失败时切换候选",
+        );
+    }
+
+    let local = probe_local_hybrid(config).await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    if local.status == "healthy" {
+        ProbeResult::degraded(
+            latency_ms,
+            "未配置云端 ASR Key，当前会使用本地模型 fallback",
+        )
+    } else {
+        ProbeResult::unconfigured("未配置云端 ASR Key，且本地 fallback 不可用")
     }
 }
 
@@ -129,14 +151,19 @@ fn probe_stepfun_streaming(config: &AppConfig) -> ProbeResult {
     ProbeResult::unknown("StepFun 实时 ASR 会在录音时建立 WebSocket 验证")
 }
 
-async fn probe_local_hybrid(config: &AppConfig) -> ProbeResult {
+async fn probe_local_hybrid(_config: &AppConfig) -> ProbeResult {
     let started = Instant::now();
-    let status = local_asr::status(Some(config), None).await;
+    let status = match local_asr::status().await {
+        Ok(status) => status,
+        Err(err) => return ProbeResult::down(&format!("本地 ASR 状态读取失败：{err}")),
+    };
     let latency_ms = started.elapsed().as_millis() as u64;
     if status.installed && status.runtime_reachable {
         ProbeResult::healthy(latency_ms)
-    } else if status.installed {
-        ProbeResult::degraded(latency_ms, "本地模型已安装，但 qwen_asr 识别引擎不可用")
+    } else if status.model_installed && !status.runtime_installed {
+        ProbeResult::degraded(latency_ms, "本地模型已安装，但 Sherpa-ONNX runtime 不可用")
+    } else if status.runtime_installed && !status.model_installed {
+        ProbeResult::unconfigured("Sherpa-ONNX runtime 已安装，但当前模型未下载")
     } else {
         ProbeResult::unconfigured("本地 ASR 模型未安装")
     }

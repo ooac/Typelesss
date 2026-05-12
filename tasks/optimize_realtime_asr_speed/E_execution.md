@@ -153,3 +153,177 @@
 #### 相关文件
 - `src-tauri/src/providers.rs`
 - `src/state/AppContext.tsx`
+
+### 任务 #1.10：Typeflux 对标本地多引擎 ✅
+**状态**：已完成
+**时间**：2026-05-12 09:48 - 2026-05-12 10:12
+**执行者**：LD
+
+#### 实现结果
+- ✅ `local_hybrid` 默认本地模型从 Qwen3-ASR 改为 `SenseVoice Small int8`。
+- ✅ 新增 Sherpa-ONNX runtime 管理：runtime 与模型分离下载、文件校验、Finder 打开模型目录。
+- ✅ 本地引擎扩展为 `sensevoice-small`、`funasr-paraformer-zh-small`、`qwen3-asr-0.6b`，分别对应平衡极速、中文极速、高准确率。
+- ✅ 普通用户 UI 改成“下载并启用 / 启用 / 镜像下载 / 打开目录 / 运行基线评测”，隐藏 endpoint/runtime server 配置感。
+- ✅ 本地识别改为 Sherpa-ONNX 离线命令行 final，SenseVoice 遇到日文/韩文输出会用中文语言参数重试。
+- ✅ 增加音频质量门禁，空录音直接返回可解释错误，不再长时间卡住。
+- ✅ 保留用户快捷键；旧 Qwen 1.7B 配置迁移到 SenseVoice，不覆盖 hotkey。
+
+#### 设计边界
+- 不复制 Typeflux 源码，只复刻 Sherpa-ONNX 运行时/模型管理思路，规避 AGPL 许可污染。
+- 本轮先保证“可用、快、准、不会乱学”，不做真正 streaming partial 与 live insert 默认开启。
+- Benchmark 先落结果结构和入口，真实评分仍需要标准音频样本。
+
+#### 相关文件
+- `src-tauri/src/local_asr.rs`
+- `src-tauri/src/lib.rs`
+- `src-tauri/src/providers.rs`
+- `src-tauri/src/health.rs`
+- `src/appDefaults.ts`
+- `src/appTypes.ts`
+- `src/components/ProviderEditor.tsx`
+- `src/SettingsForm.tsx`
+- `test/appDefaults.test.ts`
+
+### 验证更新 3 ✅
+**状态**：已完成
+**时间**：2026-05-12 10:12
+
+#### 结果
+- ✅ `npm test` 通过，23 个测试全部通过。
+- ✅ `npm run build` 通过。
+- ✅ `cargo fmt --check` 通过。
+- ✅ `cargo check` 通过。
+- ✅ `cargo test` 通过，38 个测试全部通过。
+- ✅ `git diff --check` 通过。
+
+### 修复：Sherpa RTF 日志被误当识别文本 ✅
+**状态**：已完成
+**时间**：2026-05-12 10:18 - 2026-05-12 10:19
+**执行者**：LD
+
+#### 问题
+- Sherpa-ONNX stdout 最后一行可能是 `Real time factor (RTF): ...` 性能日志。
+- 旧解析器取最后一行非空文本，导致性能日志覆盖真实识别内容。
+
+#### 解决
+- ✅ `parse_sherpa_stdout` 改为从 stdout 优先抽取 transcript，忽略 RTF、音频路径、加载/解码日志。
+- ✅ stdout 无文本时才回退读取 stderr。
+- ✅ 增加回归测试覆盖 `现在已经下了本地模型` + RTF 日志场景。
+
+#### 相关文件
+- `src-tauri/src/local_asr.rs`
+
+#### 验证
+- ✅ `cargo fmt --check` 通过。
+- ✅ `cargo check` 通过。
+- ✅ `cargo test` 通过，40 个测试全部通过。
+- ✅ `git diff --check` 通过。
+
+### 修复：纯标点低信息识别结果 ✅
+**状态**：已完成
+**时间**：2026-05-12 10:23 - 2026-05-12 10:24
+**执行者**：LD
+
+#### 问题
+- 用户说“能不能再快一点”，本地模型只返回 `。`。
+- 纯标点属于低信息识别结果，不能当作成功文本插入，也不能写入纠错词典。
+
+#### 解决
+- ✅ SenseVoice 返回日文/韩文或低信息文本时，自动用中文参数重试。
+- ✅ `。`、`.` 等纯标点结果不再视为成功识别。
+- ✅ 当前引擎只返回低信息文本时继续尝试下一个已安装本地引擎。
+- ✅ 增加回归测试覆盖纯标点低信息判断。
+
+#### 相关文件
+- `src-tauri/src/local_asr.rs`
+
+#### 验证
+- ✅ `npm test` 通过，23 个测试全部通过。
+- ✅ `cargo fmt --check` 通过。
+- ✅ `cargo check` 通过。
+- ✅ `cargo test` 通过，41 个测试全部通过。
+- ✅ `git diff --check` 通过。
+
+### 任务 #1.11：国内云端 + 本地自动择优 ✅
+**状态**：已完成
+**时间**：2026-05-12 11:02 - 2026-05-12 11:20
+**执行者**：LD
+
+#### 实现结果
+- ✅ 新增默认 `auto_optimized`，UI 文案为“极速自动 ASR”。
+- ✅ `auto_optimized` 热键录音时优先建立阿里 Paraformer realtime WebSocket，强制 `language_hints: ["zh", "en"]`。
+- ✅ 停止录音后如果实时 final 不可用，不直接报错，自动进入候选 fallback：火山、本地、硅基。
+- ✅ `TranscriptEvent` 增加 `candidateId`、`isLowInformation`、`confidence`、`language`。
+- ✅ `。`、空文本、日文/韩文高比例输出走低信息/语言门禁，不插入目标 App。
+- ✅ 普通听写不再默认走远程 LLM polish，只在提示词构建和代码提示词模式调用，减少主链路延迟。
+- ✅ 新增 provider benchmark/sample/score 命令和 SQLite 表结构，为真实评分自动择优做接口准备。
+
+#### 相关文件
+- `src-tauri/src/providers.rs`
+- `src-tauri/src/lib.rs`
+- `src-tauri/src/health.rs`
+- `src-tauri/src/app_config.rs`
+- `src/state/AppContext.tsx`
+- `src/appDefaults.ts`
+- `src/appTypes.ts`
+- `src/types.ts`
+- `src/components/ProviderEditor.tsx`
+- `src/SettingsForm.tsx`
+- `test/appDefaults.test.ts`
+
+#### 验证
+- ✅ `npm test` 通过，25 个测试全部通过。
+- ✅ `npm run build` 通过。
+- ✅ `cargo fmt --check` 通过。
+- ✅ `cargo check` 通过。
+- ✅ `cargo test` 通过，43 个测试全部通过。
+- ✅ `git diff --check` 通过。
+
+### 修复：录音开头丢字 ✅
+**状态**：已完成
+**时间**：2026-05-12 11:35 - 2026-05-12 11:44
+**执行者**：LD
+
+#### 问题
+- `start_recording` 先做插入目标 AX 捕获，再启动麦克风。
+- AX 捕获和 Tauri 调用会造成启动延迟，用户按下快捷键后立即说话时，最前面的字容易没有进入录音。
+
+#### 解决
+- ✅ 调整启动顺序：先建立实时 ASR sender，再立即启动麦克风录音，最后捕获插入目标。
+- ✅ 对 realtime PCM 和停止后的 WAV 都补 240ms 前导静音，避免 ASR 模型裁掉首音。
+- ✅ 增加前导静音回归测试。
+
+#### 相关文件
+- `src-tauri/src/lib.rs`
+- `src-tauri/src/recorder.rs`
+
+#### 验证
+- ✅ `npm test` 通过，25 个测试全部通过。
+- ✅ `npm run build` 通过。
+- ✅ `cargo fmt --check` 通过。
+- ✅ `cargo check` 通过。
+- ✅ `cargo test` 通过，44 个测试全部通过。
+- ✅ `git diff --check` 通过。
+
+### 修复：第一次录音冷启动丢字 ✅
+**状态**：已完成
+**时间**：2026-05-12 11:49 - 2026-05-12 11:54
+**执行者**：LD
+
+#### 问题
+- 第一次启动后正式录音仍容易丢开头，后续录音正常。
+- 这是 macOS 默认输入设备冷启动问题：首次打开输入流时音频回调需要预热。
+
+#### 解决
+- ✅ App 启动后后台打开默认麦克风输入流约 900ms，然后立即释放。
+- ✅ 预热流不保存音频、不发送 ASR，只消除第一次正式录音的硬件冷启动成本。
+- ✅ 预热失败只记录日志，不阻塞 App 启动和正式录音。
+
+#### 相关文件
+- `src-tauri/src/recorder.rs`
+- `src-tauri/src/lib.rs`
+
+#### 验证
+- ✅ `cargo fmt --check` 通过。
+- ✅ `cargo check` 通过。
+- ✅ `cargo test` 通过，44 个测试全部通过。

@@ -12,10 +12,11 @@ use app_config::{load_config_from_disk, save_config_to_disk, AppConfig, Preset};
 use insertion::InsertTarget;
 use modifier_hotkey::{ModifierHotkeyState, RIGHT_OPTION_HOTKEY};
 use recorder::{Recorder, RecordingResult};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
@@ -34,7 +35,89 @@ struct AppState {
     /// cleanly when presets change.
     shortcut_registry: Arc<Mutex<Vec<(String, Shortcut)>>>,
     local_asr_process: Mutex<Option<Child>>,
-    local_asr_downloads: Arc<local_asr::LocalAsrDownloadState>,
+    composition: Mutex<Option<CompositionState>>,
+    last_insert_target: Mutex<Option<InsertTarget>>,
+    recent_insert_contexts: Mutex<VecDeque<RecentInsertContext>>,
+}
+
+#[derive(Clone, Debug)]
+struct CompositionState {
+    session_id: String,
+    target: Option<InsertTarget>,
+    current_text: String,
+}
+
+#[derive(Clone, Debug)]
+struct RecentInsertContext {
+    session_id: String,
+    target: Option<InsertTarget>,
+    raw_text: String,
+    final_text: String,
+    inserted_text: String,
+    inserted_at_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RememberInsertContextPayload {
+    session_id: String,
+    raw_text: String,
+    final_text: String,
+    inserted_text: String,
+    inserted_at_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadbackResult {
+    session_id: String,
+    target_app: String,
+    inserted_text: String,
+    edited_text: String,
+    read_text: String,
+    learned: bool,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LearnSelectedTextResult {
+    selected_text: String,
+    target_app: String,
+    matched_session_id: Option<String>,
+    inserted_text: String,
+    learned: bool,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveBenchmarkSamplePayload {
+    expected_text: String,
+    audio_path: Option<String>,
+    category: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderScore {
+    provider_id: String,
+    score: f64,
+    p50_first_partial_ms: Option<u64>,
+    p95_first_partial_ms: Option<u64>,
+    p50_final_ms: Option<u64>,
+    error_rate: f64,
+    tech_term_recall: f64,
+    sample_count: u64,
+    updated_at: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoAsrSessionInfo {
+    session_id: String,
+    first_candidate_id: String,
+    candidates: Vec<String>,
 }
 
 #[tauri::command]
@@ -60,6 +143,16 @@ fn start_recording(
     state: tauri::State<AppState>,
     config: AppConfig,
 ) -> Result<(), String> {
+    let realtime_tx =
+        providers::start_realtime_asr(&app, &config).map_err(|err| err.to_string())?;
+
+    state
+        .recorder
+        .lock()
+        .map_err(|_| "录音状态锁定失败".to_string())?
+        .start_with_realtime(realtime_tx)
+        .map_err(|err| err.to_string())?;
+
     let insert_target = insertion::capture_insert_target()
         .map_err(|err| {
             eprintln!("failed to capture insert target: {err}");
@@ -79,16 +172,7 @@ fn start_recording(
         .insert_target
         .lock()
         .map_err(|_| "插入目标状态锁定失败".to_string())? = insert_target;
-
-    let realtime_tx =
-        providers::start_realtime_asr(&app, &config).map_err(|err| err.to_string())?;
-
-    state
-        .recorder
-        .lock()
-        .map_err(|_| "录音状态锁定失败".to_string())?
-        .start_with_realtime(realtime_tx)
-        .map_err(|err| err.to_string())
+    Ok(())
 }
 
 #[tauri::command]
@@ -123,6 +207,34 @@ async fn transcribe_audio(config: AppConfig, wav_path: String) -> Result<String,
 }
 
 #[tauri::command]
+fn cleanup_recording_file(wav_path: String) -> Result<(), String> {
+    if std::env::var("TYPELESS_KEEP_RECORDINGS").ok().as_deref() == Some("1") {
+        return Ok(());
+    }
+    let path = PathBuf::from(&wav_path);
+    if path.extension().and_then(|value| value.to_str()) != Some("wav") {
+        return Err("只允许清理临时 WAV 录音文件".to_string());
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|err| format!("录音文件不存在或无法访问：{err}"))?;
+    let temp_root = std::env::temp_dir()
+        .canonicalize()
+        .map_err(|err| format!("无法定位系统临时目录：{err}"))?;
+    if !canonical.starts_with(&temp_root) {
+        return Err("拒绝清理非临时目录中的录音文件".to_string());
+    }
+    if canonical.exists() {
+        std::fs::remove_file(&canonical).map_err(|err| format!("无法清理临时录音文件：{err}"))?;
+    }
+    let sibling_without_ext = canonical.with_extension("");
+    if sibling_without_ext.starts_with(&temp_root) && sibling_without_ext.exists() {
+        let _ = std::fs::remove_file(sibling_without_ext);
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn polish_text(config: AppConfig, text: String, mode: String) -> Result<String, String> {
     providers::polish_text(&config, &text, &mode)
         .await
@@ -148,149 +260,150 @@ async fn check_secret_status() -> Result<health::SecretStatus, String> {
 
 #[tauri::command]
 async fn local_asr_status(
-    state: tauri::State<'_, AppState>,
-    config: AppConfig,
+    _state: tauri::State<'_, AppState>,
+    _config: AppConfig,
 ) -> Result<local_asr::LocalAsrStatus, String> {
-    Ok(local_asr::status(Some(&config), Some(&state.local_asr_downloads)).await)
+    local_asr::status().await.map_err(|err| err.to_string())
 }
 
 #[tauri::command]
 async fn install_local_asr_models(
-    state: tauri::State<'_, AppState>,
+    _state: tauri::State<'_, AppState>,
 ) -> Result<local_asr::LocalAsrStatus, String> {
-    local_asr::install_models(Some(&state.local_asr_downloads))
+    local_asr::install_models()
         .await
         .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
 async fn install_local_asr_runtime(
-    state: tauri::State<'_, AppState>,
+    _state: tauri::State<'_, AppState>,
 ) -> Result<local_asr::LocalAsrStatus, String> {
-    local_asr::install_runtime(Some(&state.local_asr_downloads))
+    local_asr::install_runtime()
         .await
         .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
-fn open_local_asr_models_dir() -> Result<String, String> {
-    local_asr::open_models_dir().map_err(|err| err.to_string())
+async fn open_local_asr_models_dir(app: AppHandle) -> Result<String, String> {
+    local_asr::open_models_dir(app)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn open_local_asr_benchmark_dir(app: AppHandle) -> Result<String, String> {
+    local_asr::open_benchmark_dir(app)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
 async fn list_local_asr_models(
-    state: tauri::State<'_, AppState>,
+    _state: tauri::State<'_, AppState>,
 ) -> Result<Vec<local_asr::LocalModelStatus>, String> {
-    let config = load_config_from_disk().ok();
-    Ok(local_asr::list_models(config.as_ref(), Some(&state.local_asr_downloads)).await)
+    local_asr::list_models()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn list_local_asr_engines(
+    _state: tauri::State<'_, AppState>,
+) -> Result<Vec<local_asr::LocalAsrEngineStatus>, String> {
+    local_asr::list_engines()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn download_local_asr_engine(
+    app: AppHandle,
+    _state: tauri::State<'_, AppState>,
+    engine_id: String,
+    mirror: Option<String>,
+) -> Result<local_asr::LocalAsrStatus, String> {
+    local_asr::download_engine(app, engine_id, mirror)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn activate_local_asr_engine(
+    _state: tauri::State<'_, AppState>,
+    engine_id: String,
+) -> Result<local_asr::LocalAsrStatus, String> {
+    local_asr::activate_engine(engine_id)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn delete_local_asr_engine(
+    _state: tauri::State<'_, AppState>,
+    engine_id: String,
+) -> Result<local_asr::LocalAsrStatus, String> {
+    local_asr::delete_engine(engine_id)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
 async fn download_local_asr_model(
     app: AppHandle,
-    state: tauri::State<'_, AppState>,
+    _state: tauri::State<'_, AppState>,
     model_id: String,
     mirror: Option<String>,
 ) -> Result<local_asr::LocalAsrStatus, String> {
-    local_asr::download_model(
-        app,
-        &model_id,
-        local_asr::DownloadMirror::from_str(mirror.as_deref().unwrap_or_default()),
-        Arc::clone(&state.local_asr_downloads),
-    )
-    .await
-    .map_err(|err| err.to_string())
+    local_asr::download_model(app, model_id, mirror)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
 fn cancel_local_asr_download(
-    state: tauri::State<'_, AppState>,
+    _state: tauri::State<'_, AppState>,
     model_id: String,
 ) -> Result<(), String> {
-    local_asr::cancel_download(&model_id, &state.local_asr_downloads).map_err(|err| err.to_string())
+    tauri::async_runtime::block_on(local_asr::cancel_download(model_id))
+        .map(|_| ())
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
 async fn activate_local_asr_model(
-    state: tauri::State<'_, AppState>,
+    _state: tauri::State<'_, AppState>,
     model_id: String,
 ) -> Result<local_asr::LocalAsrStatus, String> {
-    local_asr::activate_model(&model_id, Some(&state.local_asr_downloads))
+    local_asr::activate_model(model_id)
         .await
         .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
 async fn delete_local_asr_model(
-    state: tauri::State<'_, AppState>,
+    _state: tauri::State<'_, AppState>,
     model_id: String,
 ) -> Result<local_asr::LocalAsrStatus, String> {
-    local_asr::delete_model(&model_id, Some(&state.local_asr_downloads))
+    local_asr::delete_model(model_id)
         .await
         .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
 async fn start_local_asr_runtime(
-    state: tauri::State<'_, AppState>,
-    config: AppConfig,
+    _state: tauri::State<'_, AppState>,
+    _config: AppConfig,
 ) -> Result<local_asr::LocalAsrStatus, String> {
-    if local_asr::status(Some(&config), Some(&state.local_asr_downloads))
+    local_asr::start_runtime()
         .await
-        .runtime_reachable
-    {
-        return Ok(local_asr::status(Some(&config), Some(&state.local_asr_downloads)).await);
-    }
-
-    let already_running = {
-        let mut process = state
-            .local_asr_process
-            .lock()
-            .map_err(|_| "本地 ASR runtime 状态锁定失败".to_string())?;
-        if let Some(child) = process.as_mut() {
-            if child.try_wait().map_err(|err| err.to_string())?.is_none() {
-                true
-            } else {
-                *process = None;
-                false
-            }
-        } else {
-            false
-        }
-    };
-    if already_running {
-        return Ok(local_asr::status(Some(&config), Some(&state.local_asr_downloads)).await);
-    }
-
-    {
-        let mut process = state
-            .local_asr_process
-            .lock()
-            .map_err(|_| "本地 ASR runtime 状态锁定失败".to_string())?;
-        let mut command =
-            local_asr::build_online_server_command(&config).map_err(|err| err.to_string())?;
-        command.stdout(Stdio::null()).stderr(Stdio::null());
-        let child = command
-            .spawn()
-            .map_err(|err| format!("启动本地 ASR runtime 失败：{err}"))?;
-        *process = Some(child);
-    }
-
-    for _ in 0..20 {
-        let status = local_asr::status(Some(&config), Some(&state.local_asr_downloads)).await;
-        if status.runtime_reachable {
-            return Ok(status);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    }
-
-    Ok(local_asr::status(Some(&config), Some(&state.local_asr_downloads)).await)
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
 async fn stop_local_asr_runtime(
     state: tauri::State<'_, AppState>,
-    config: AppConfig,
+    _config: AppConfig,
 ) -> Result<local_asr::LocalAsrStatus, String> {
     {
         let mut process = state
@@ -302,7 +415,9 @@ async fn stop_local_asr_runtime(
             let _ = child.wait();
         }
     }
-    Ok(local_asr::status(Some(&config), Some(&state.local_asr_downloads)).await)
+    local_asr::stop_runtime()
+        .await
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -322,6 +437,10 @@ fn paste_text(state: tauri::State<AppState>, text: String) -> Result<String, Str
         .lock()
         .map_err(|_| "插入目标状态锁定失败".to_string())?
         .take();
+    *state
+        .last_insert_target
+        .lock()
+        .map_err(|_| "最近插入目标状态锁定失败".to_string())? = insert_target.clone();
     if let Some(target) = insert_target.as_ref() {
         eprintln!(
             "paste_text invoked: {} chars, target {} ({})",
@@ -336,6 +455,319 @@ fn paste_text(state: tauri::State<AppState>, text: String) -> Result<String, Str
         );
     }
     insertion::paste_text(&text, insert_target.as_ref()).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn begin_composition(state: tauri::State<AppState>) -> Result<String, String> {
+    let target = state
+        .insert_target
+        .lock()
+        .map_err(|_| "插入目标状态锁定失败".to_string())?
+        .clone();
+    let session_id = uuid::Uuid::new_v4().to_string();
+    *state
+        .composition
+        .lock()
+        .map_err(|_| "组合输入状态锁定失败".to_string())? = Some(CompositionState {
+        session_id: session_id.clone(),
+        target,
+        current_text: String::new(),
+    });
+    Ok(session_id)
+}
+
+#[tauri::command]
+fn apply_composition_patch(
+    state: tauri::State<AppState>,
+    session_id: String,
+    text: String,
+    kind: String,
+) -> Result<String, String> {
+    let (target, previous_chars) = {
+        let mut composition = state
+            .composition
+            .lock()
+            .map_err(|_| "组合输入状态锁定失败".to_string())?;
+        let active = composition
+            .as_mut()
+            .ok_or_else(|| "当前没有组合输入会话".to_string())?;
+        if active.session_id != session_id {
+            return Err("组合输入会话已过期".to_string());
+        }
+        let previous_chars = active.current_text.chars().count();
+        active.current_text = text.clone();
+        (active.target.clone(), previous_chars)
+    };
+    insertion::replace_composition_text(&text, target.as_ref(), previous_chars)
+        .map_err(|err| format!("{} patch 失败：{err}", kind))
+}
+
+#[tauri::command]
+fn finish_composition(state: tauri::State<AppState>, session_id: String) -> Result<(), String> {
+    let mut composition = state
+        .composition
+        .lock()
+        .map_err(|_| "组合输入状态锁定失败".to_string())?;
+    if composition
+        .as_ref()
+        .map(|active| active.session_id.as_str())
+        == Some(session_id.as_str())
+    {
+        let target = composition
+            .as_ref()
+            .and_then(|active| active.target.clone());
+        *state
+            .last_insert_target
+            .lock()
+            .map_err(|_| "最近插入目标状态锁定失败".to_string())? = target;
+        *composition = None;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_composition(state: tauri::State<AppState>, session_id: String) -> Result<(), String> {
+    let active = {
+        let mut composition = state
+            .composition
+            .lock()
+            .map_err(|_| "组合输入状态锁定失败".to_string())?;
+        match composition.as_ref() {
+            Some(active) if active.session_id == session_id => composition.take(),
+            _ => None,
+        }
+    };
+    if let Some(active) = active {
+        if !active.current_text.is_empty() {
+            insertion::replace_composition_text(
+                "",
+                active.target.as_ref(),
+                active.current_text.chars().count(),
+            )
+            .map_err(|err| format!("撤销实时输入失败：{err}"))?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn run_asr_benchmark() -> Result<local_asr::BenchmarkResult, String> {
+    let config = load_config_from_disk().unwrap_or_default();
+    local_asr::run_benchmark(config.local_asr_engine_id)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn start_auto_asr_session(config: AppConfig) -> Result<AutoAsrSessionInfo, String> {
+    let candidates = if config.asr_provider_candidates.is_empty() {
+        vec![
+            "alibaba_paraformer_realtime".to_string(),
+            "volcengine".to_string(),
+            "local_hybrid".to_string(),
+            "whisper_compatible".to_string(),
+        ]
+    } else {
+        config
+            .asr_provider_candidates
+            .iter()
+            .map(|candidate| candidate.trim())
+            .filter(|candidate| !candidate.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let first_candidate_id = candidates
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "alibaba_paraformer_realtime".to_string());
+    Ok(AutoAsrSessionInfo {
+        session_id: uuid::Uuid::new_v4().to_string(),
+        first_candidate_id,
+        candidates,
+    })
+}
+
+#[tauri::command]
+fn list_provider_scores() -> Result<Vec<ProviderScore>, String> {
+    let now = current_timestamp_ms();
+    Ok(vec![
+        ProviderScore {
+            provider_id: "alibaba_paraformer_realtime".to_string(),
+            score: 0.0,
+            p50_first_partial_ms: None,
+            p95_first_partial_ms: None,
+            p50_final_ms: None,
+            error_rate: 0.0,
+            tech_term_recall: 0.0,
+            sample_count: 0,
+            updated_at: now,
+        },
+        ProviderScore {
+            provider_id: "volcengine".to_string(),
+            score: 0.0,
+            p50_first_partial_ms: None,
+            p95_first_partial_ms: None,
+            p50_final_ms: None,
+            error_rate: 0.0,
+            tech_term_recall: 0.0,
+            sample_count: 0,
+            updated_at: now,
+        },
+        ProviderScore {
+            provider_id: "local_hybrid".to_string(),
+            score: 0.0,
+            p50_first_partial_ms: None,
+            p95_first_partial_ms: None,
+            p50_final_ms: None,
+            error_rate: 0.0,
+            tech_term_recall: 0.0,
+            sample_count: 0,
+            updated_at: now,
+        },
+    ])
+}
+
+#[tauri::command]
+fn run_provider_benchmark() -> Result<Vec<ProviderScore>, String> {
+    list_provider_scores()
+}
+
+#[tauri::command]
+fn save_benchmark_sample(
+    app: AppHandle,
+    payload: SaveBenchmarkSamplePayload,
+) -> Result<String, String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("无法定位 App data 目录：{err}"))?
+        .join("asr-benchmark-samples");
+    std::fs::create_dir_all(&dir).map_err(|err| format!("无法创建评测样本目录：{err}"))?;
+    let category = payload
+        .category
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("manual");
+    let meta = serde_json::json!({
+        "id": id,
+        "expectedText": payload.expected_text,
+        "audioPath": payload.audio_path,
+        "category": category,
+        "createdAt": current_timestamp_ms()
+    });
+    let meta_path = dir.join(format!("{id}.json"));
+    std::fs::write(
+        &meta_path,
+        serde_json::to_vec_pretty(&meta).map_err(|err| format!("无法编码评测样本：{err}"))?,
+    )
+    .map_err(|err| format!("无法写入评测样本：{err}"))?;
+    Ok(id)
+}
+
+#[tauri::command]
+fn remember_recent_insert_context(
+    state: tauri::State<AppState>,
+    payload: RememberInsertContextPayload,
+) -> Result<(), String> {
+    let target = state
+        .last_insert_target
+        .lock()
+        .map_err(|_| "最近插入目标状态锁定失败".to_string())?
+        .clone()
+        .or_else(|| {
+            state
+                .insert_target
+                .lock()
+                .ok()
+                .and_then(|target| target.clone())
+        });
+    let mut contexts = state
+        .recent_insert_contexts
+        .lock()
+        .map_err(|_| "最近插入上下文状态锁定失败".to_string())?;
+    contexts.push_front(RecentInsertContext {
+        session_id: payload.session_id,
+        target,
+        raw_text: payload.raw_text,
+        final_text: payload.final_text,
+        inserted_text: payload.inserted_text,
+        inserted_at_ms: payload.inserted_at_ms,
+    });
+    while contexts.len() > 12 {
+        contexts.pop_back();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn read_recent_insert_context(
+    state: tauri::State<AppState>,
+    session_id: String,
+) -> Result<ReadbackResult, String> {
+    let context = state
+        .recent_insert_contexts
+        .lock()
+        .map_err(|_| "最近插入上下文状态锁定失败".to_string())?
+        .iter()
+        .find(|context| context.session_id == session_id)
+        .cloned()
+        .ok_or_else(|| "没有找到最近插入上下文".to_string())?;
+    if current_timestamp_ms().saturating_sub(context.inserted_at_ms) > 10 * 60 * 1000 {
+        return Err("最近插入上下文已过期".to_string());
+    }
+    let target_app = context
+        .target
+        .as_ref()
+        .map(|target| target.app_name.clone())
+        .unwrap_or_default();
+    let read_text =
+        insertion::read_focused_text_window(context.target.as_ref(), &context.inserted_text)
+            .map_err(|err| err.to_string())?;
+    let edited_text = infer_edited_text(&context.inserted_text, &read_text);
+    Ok(ReadbackResult {
+        session_id,
+        target_app,
+        inserted_text: context.inserted_text,
+        edited_text,
+        read_text,
+        learned: false,
+        reason: "read".to_string(),
+    })
+}
+
+#[tauri::command]
+fn learn_selected_text(state: tauri::State<AppState>) -> Result<LearnSelectedTextResult, String> {
+    let (selected_text, target) = insertion::read_selected_text().map_err(|err| err.to_string())?;
+    let selected_text = selected_text.trim().to_string();
+    let context = state
+        .recent_insert_contexts
+        .lock()
+        .map_err(|_| "最近插入上下文状态锁定失败".to_string())?
+        .iter()
+        .find(|context| {
+            !selected_text.is_empty()
+                && (context.inserted_text.contains(&selected_text)
+                    || context.raw_text.contains(&selected_text)
+                    || context.final_text.contains(&selected_text)
+                    || similar_short_text(&context.inserted_text, &selected_text))
+        })
+        .cloned();
+    Ok(LearnSelectedTextResult {
+        selected_text,
+        target_app: target
+            .as_ref()
+            .map(|target| target.app_name.clone())
+            .unwrap_or_default(),
+        matched_session_id: context.as_ref().map(|context| context.session_id.clone()),
+        inserted_text: context
+            .as_ref()
+            .map(|context| context.inserted_text.clone())
+            .unwrap_or_default(),
+        learned: false,
+        reason: "selected".to_string(),
+    })
 }
 
 #[tauri::command]
@@ -617,6 +1049,87 @@ mod tests {
     }
 }
 
+fn infer_edited_text(inserted_text: &str, read_text: &str) -> String {
+    let inserted = inserted_text.trim();
+    let read = read_text.trim();
+    if read.is_empty() || read.contains(inserted) {
+        return inserted.to_string();
+    }
+    let inserted_len = inserted.chars().count();
+    let read_len = read.chars().count();
+    if inserted_len > 0
+        && read_len <= inserted_len.saturating_mul(2).saturating_add(8)
+        && similar_short_text(inserted, read)
+    {
+        return read.to_string();
+    }
+    inserted.to_string()
+}
+
+fn similar_short_text(left: &str, right: &str) -> bool {
+    let left = compact_text(left);
+    let right = compact_text(right);
+    if left.is_empty() || right.is_empty() || left.len() > 96 || right.len() > 96 {
+        return false;
+    }
+    let distance = levenshtein_chars(&left, &right);
+    let max_len = left.chars().count().max(right.chars().count()).max(1);
+    distance * 100 / max_len <= 45
+}
+
+fn compact_text(input: &str) -> String {
+    input
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && !matches!(ch, '。' | '.' | ',' | '，'))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn levenshtein_chars(left: &str, right: &str) -> usize {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+    for (i, left_item) in left.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, right_item) in right.iter().enumerate() {
+            let cost = usize::from(left_item != right_item);
+            current[j + 1] = (previous[j + 1] + 1)
+                .min(current[j] + 1)
+                .min(previous[j] + cost);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
+
+fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod correction_memory_tests {
+    use super::*;
+
+    #[test]
+    fn infers_short_edited_text_from_readback() {
+        assert_eq!(infer_edited_text("codeex。", "codex。"), "codex。");
+        assert_eq!(
+            infer_edited_text("codeex。", "我要使用 codeex。"),
+            "codeex。"
+        );
+    }
+
+    #[test]
+    fn matches_similar_short_text() {
+        assert!(similar_short_text("codeex。", "codex"));
+        assert!(!similar_short_text("一段很长的完全不同文本", "codex"));
+    }
+}
+
 pub fn run() {
     let active_hotkey: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let shortcut_registry: Arc<Mutex<Vec<(String, Shortcut)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -723,6 +1236,71 @@ pub fn run() {
         "#,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 3,
+            description: "create local asr benchmark table",
+            sql: r#"
+            CREATE TABLE IF NOT EXISTS asr_benchmark_runs (
+                id TEXT PRIMARY KEY,
+                engine_id TEXT NOT NULL,
+                mode TEXT NOT NULL DEFAULT '',
+                sample_count INTEGER NOT NULL DEFAULT 0,
+                p50_first_partial_ms INTEGER,
+                p95_first_partial_ms INTEGER,
+                p50_final_ms INTEGER,
+                p95_final_ms INTEGER,
+                cer REAL,
+                wer REAL,
+                tech_term_recall REAL,
+                target_app TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_asr_benchmark_engine_created
+                ON asr_benchmark_runs (engine_id, created_at DESC);
+        "#,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 4,
+            description: "create optimized asr provider benchmark tables",
+            sql: r#"
+            CREATE TABLE IF NOT EXISTS asr_benchmark_samples (
+                id TEXT PRIMARY KEY,
+                expected_text TEXT NOT NULL DEFAULT '',
+                audio_path TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_asr_benchmark_samples_category_created
+                ON asr_benchmark_samples (category, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS asr_provider_scores (
+                provider_id TEXT PRIMARY KEY,
+                score REAL NOT NULL DEFAULT 0,
+                p50_first_partial_ms INTEGER,
+                p95_first_partial_ms INTEGER,
+                p50_final_ms INTEGER,
+                error_rate REAL NOT NULL DEFAULT 0,
+                tech_term_recall REAL NOT NULL DEFAULT 0,
+                sample_count INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS asr_session_candidates (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                candidate_order INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT '',
+                latency_ms INTEGER,
+                error TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_asr_session_candidates_session
+                ON asr_session_candidates (session_id, candidate_order);
+        "#,
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
@@ -739,7 +1317,9 @@ pub fn run() {
             modifier_hotkey: ModifierHotkeyState::new(active_hotkey),
             shortcut_registry,
             local_asr_process: Mutex::new(None),
-            local_asr_downloads: Arc::new(local_asr::LocalAsrDownloadState::new()),
+            composition: Mutex::new(None),
+            last_insert_target: Mutex::new(None),
+            recent_insert_contexts: Mutex::new(VecDeque::new()),
         })
         .setup(|app| {
             let _ = app.path().app_config_dir();
@@ -751,25 +1331,15 @@ pub fn run() {
                 &config.presets,
             ) {
                 eprintln!("failed to register configured presets: {err}");
-                let fallback = Preset {
-                    id: "default".to_string(),
-                    label: "默认".to_string(),
-                    hotkey: "Control+Option+Space".to_string(),
-                    output_mode: config.output_mode.clone(),
-                };
-                config.presets = vec![fallback.clone()];
-                config.active_preset_id = fallback.id.clone();
-                config.hotkey = fallback.hotkey.clone();
-                let _ = register_presets(
-                    app.handle(),
-                    app.state::<AppState>().inner(),
-                    &config.presets,
-                );
-                let _ = save_config_to_disk(&config);
             }
             if !insertion::has_accessibility_permission() {
                 let _ = insertion::request_accessibility_permission();
             }
+            std::thread::spawn(|| {
+                if let Err(err) = recorder::warm_up_input_device() {
+                    eprintln!("microphone warm-up skipped: {err}");
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -777,6 +1347,7 @@ pub fn run() {
             save_config,
             start_recording,
             stop_recording,
+            cleanup_recording_file,
             cancel_recording,
             transcribe_audio,
             polish_text,
@@ -793,13 +1364,30 @@ pub fn run() {
             install_local_asr_models,
             install_local_asr_runtime,
             open_local_asr_models_dir,
+            open_local_asr_benchmark_dir,
             list_local_asr_models,
+            list_local_asr_engines,
             download_local_asr_model,
+            download_local_asr_engine,
             cancel_local_asr_download,
             activate_local_asr_model,
+            activate_local_asr_engine,
             delete_local_asr_model,
+            delete_local_asr_engine,
             start_local_asr_runtime,
             stop_local_asr_runtime,
+            begin_composition,
+            apply_composition_patch,
+            finish_composition,
+            cancel_composition,
+            start_auto_asr_session,
+            run_provider_benchmark,
+            save_benchmark_sample,
+            list_provider_scores,
+            run_asr_benchmark,
+            remember_recent_insert_context,
+            read_recent_insert_context,
+            learn_selected_text,
             check_permissions,
             test_microphone
         ])

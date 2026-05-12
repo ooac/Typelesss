@@ -57,6 +57,20 @@ export interface AsrTelemetryInput {
   error?: string;
 }
 
+export interface AsrBenchmarkRunInput {
+  engineId: string;
+  mode: string;
+  sampleCount: number;
+  p50FirstPartialMs?: number | null;
+  p95FirstPartialMs?: number | null;
+  p50FinalMs?: number | null;
+  p95FinalMs?: number | null;
+  cer?: number | null;
+  wer?: number | null;
+  techTermRecall?: number | null;
+  targetApp?: string;
+}
+
 interface SessionRow {
   id: string;
   started_at: number;
@@ -79,6 +93,15 @@ interface PersonalTermRow {
   weight: number;
   usage_count: number;
   last_seen_at: number;
+}
+
+interface CorrectionPairRow {
+  id: string;
+  session_id: string;
+  before_text: string;
+  after_text: string;
+  source: string;
+  created_at: number;
 }
 
 function rowToSession(row: SessionRow): DictationSession {
@@ -189,6 +212,31 @@ export async function recordAsrTelemetry(input: AsrTelemetryInput): Promise<void
   );
 }
 
+export async function recordAsrBenchmarkRun(input: AsrBenchmarkRunInput): Promise<void> {
+  const db = await getDb();
+  await db.execute(
+    `INSERT INTO asr_benchmark_runs
+       (id, engine_id, mode, sample_count, p50_first_partial_ms, p95_first_partial_ms,
+        p50_final_ms, p95_final_ms, cer, wer, tech_term_recall, target_app, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      generatePrefixedId("b"),
+      input.engineId,
+      input.mode,
+      input.sampleCount,
+      input.p50FirstPartialMs ?? null,
+      input.p95FirstPartialMs ?? null,
+      input.p50FinalMs ?? null,
+      input.p95FinalMs ?? null,
+      input.cer ?? null,
+      input.wer ?? null,
+      input.techTermRecall ?? null,
+      input.targetApp ?? "",
+      Date.now(),
+    ],
+  );
+}
+
 export async function listPersonalTerms(limit = 80): Promise<PersonalTerm[]> {
   const db = await getDb();
   const rows = await db.select<PersonalTermRow[]>(
@@ -226,6 +274,68 @@ export async function learnPersonalTermsFromText(text: string, source = "session
       [generatePrefixedId("p"), term, source, now, now],
     );
   }
+}
+
+export async function upsertPersonalTerm(
+  canonical: string,
+  aliases: string[] = [],
+  source = "manual",
+): Promise<void> {
+  const term = canonical.trim();
+  if (!isValidLearnedTerm(term)) return;
+  const cleanAliases = [...new Set(aliases.map((alias) => alias.trim()).filter(isValidLearnedAlias))];
+  const db = await getDb();
+  const now = Date.now();
+  await db.execute(
+    `INSERT INTO personal_terms
+       (id, canonical, aliases_json, category, source, weight, usage_count, created_at, last_seen_at)
+     VALUES (?, ?, ?, 'personal', ?, 2, 1, ?, ?)
+     ON CONFLICT(canonical) DO UPDATE SET
+       aliases_json = excluded.aliases_json,
+       usage_count = usage_count + 1,
+       weight = MIN(weight + 0.5, 10),
+       last_seen_at = excluded.last_seen_at`,
+    [generatePrefixedId("p"), term, JSON.stringify(cleanAliases), source, now, now],
+  );
+}
+
+export async function insertCorrectionPair(
+  sessionId: string,
+  beforeText: string,
+  afterText: string,
+  source = "manual",
+): Promise<boolean> {
+  const before = beforeText.trim();
+  const after = afterText.trim();
+  if (!isUsefulCorrection(before, after)) return false;
+  const db = await getDb();
+  await db.execute(
+    `INSERT INTO correction_pairs
+       (id, session_id, before_text, after_text, source, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [generatePrefixedId("c"), sessionId, before, after, source, Date.now()],
+  );
+  await upsertPersonalTerm(after, [before], source);
+  return true;
+}
+
+export async function listCorrectionPairs(limit = 120): Promise<CorrectionPair[]> {
+  const db = await getDb();
+  const rows = await db.select<CorrectionPairRow[]>(
+    `SELECT * FROM correction_pairs
+     WHERE before_text <> after_text
+     ORDER BY created_at DESC
+     LIMIT ?`,
+    [limit],
+  );
+  return rows.map((row) => ({
+    id: row.id,
+    sessionId: row.session_id,
+    beforeText: row.before_text,
+    afterText: row.after_text,
+    source: row.source,
+    createdAt: row.created_at,
+  }));
 }
 
 export async function listRecentSessions(limit = 200): Promise<DictationSession[]> {
@@ -290,4 +400,61 @@ function extractPersonalTermCandidates(text: string): string[] {
     terms.add(match[0]);
   }
   return [...terms].filter((term) => term.length >= 2 && term.length <= 64);
+}
+
+function isUsefulCorrection(before: string, after: string): boolean {
+  if (!before || !after || before === after) return false;
+  if (before.length > 120 || after.length > 120) return false;
+  if (/^[\s\p{P}\p{S}]+$/u.test(before) || /^[\s\p{P}\p{S}]+$/u.test(after)) return false;
+  const maxLen = Math.max([...before].length, [...after].length, 1);
+  const minLen = Math.min([...before].length, [...after].length);
+  if (minLen < 2) return false;
+  if (maxLen > minLen * 2 + 8) return false;
+  return areCorrectionTextsRelated(before, after);
+}
+
+function areCorrectionTextsRelated(before: string, after: string): boolean {
+  const left = compactCorrectionText(before);
+  const right = compactCorrectionText(after);
+  if (left.length < 2 || right.length < 2) return false;
+  const maxLen = Math.max([...left].length, [...right].length, 1);
+  const minLen = Math.min([...left].length, [...right].length);
+  if (maxLen > minLen * 2 + 8) return false;
+  const distance = levenshtein(left, right);
+  return distance <= Math.max(1, Math.floor(maxLen * 0.42));
+}
+
+function compactCorrectionText(text: string): string {
+  return text
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[\s\p{P}\p{S}]+/gu, "");
+}
+
+function levenshtein(left: string, right: string): number {
+  const a = [...left];
+  const b = [...right];
+  const dp = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0));
+  for (let i = 0; i <= a.length; i += 1) dp[i]![0] = i;
+  for (let j = 0; j <= b.length; j += 1) dp[0]![j] = j;
+  for (let i = 1; i <= a.length; i += 1) {
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i]![j] = Math.min(
+        dp[i - 1]![j]! + 1,
+        dp[i]![j - 1]! + 1,
+        dp[i - 1]![j - 1]! + cost,
+      );
+    }
+  }
+  return dp[a.length]![b.length]!;
+}
+
+function isValidLearnedTerm(term: string): boolean {
+  if (term.length < 2 || term.length > 80) return false;
+  return !/^[\s\p{P}\p{S}]+$/u.test(term);
+}
+
+function isValidLearnedAlias(alias: string): boolean {
+  return isValidLearnedTerm(alias) && alias.length <= 80;
 }

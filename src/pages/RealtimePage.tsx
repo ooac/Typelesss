@@ -1,4 +1,4 @@
-import { ChevronDown, Eraser } from "lucide-react";
+import { ChevronDown, Eraser, Lightbulb } from "lucide-react";
 import { useState } from "react";
 import { InlineCapsulePreview } from "../components/InlineCapsulePreview.js";
 import { ProviderEditor } from "../components/ProviderEditor.js";
@@ -7,7 +7,7 @@ import { WaveDots } from "../components/WaveDots.js";
 import { useApp } from "../state/AppContext.js";
 
 export function RealtimePage() {
-  const { state, finalText, clearTranscript } = useApp();
+  const { state, finalText, clearTranscript, learnSelectedText } = useApp();
   const [autoScroll, setAutoScroll] = useState(true);
   const finalStatus: CardStatus = state === "inserted" ? "ready" : "idle";
 
@@ -32,6 +32,15 @@ export function RealtimePage() {
               >
                 {autoScroll ? "自动滚动" : "停止滚动"}
                 <ChevronDown size={14} />
+              </button>
+              <button
+                type="button"
+                className="ghost compact"
+                onClick={() => void learnSelectedText()}
+                title="把当前目标软件中的选中文本学习为个人术语或纠错"
+              >
+                <Lightbulb size={14} />
+                学习选中文本
               </button>
               <button
                 type="button"

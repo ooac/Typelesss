@@ -12,7 +12,9 @@
 | 1.6 | 本地 runtime sidecar | ✅ | 可安装 sherpa-onnx-bin，可启动/停止在线 WebSocket server |
 | 1.7 | SQLite 主动记忆 | ✅ | telemetry、personal_terms、app profiles 落库，个人术语回灌 normalizer/stabilizer |
 | 1.8 | stable live insert / final replace | 🟡 | 用 ShadowBuffer 安全替换，不重复、不乱序 |
-| 1.9 | Provider benchmark | 🔵 | 输出 first partial、final latency、CER/WER、技术词召回 |
+| 1.9 | Provider benchmark | 🟡 | 输出 first partial、final latency、CER/WER、技术词召回 |
+| 1.10 | Typeflux 对标本地多引擎 | ✅ | SenseVoice 默认、FunASR/Qwen 可选、Sherpa runtime/model 分离，一键下载启用 |
+| 1.11 | 国内云端 + 本地自动择优 | ✅ | `auto_optimized` 默认走阿里 realtime，失败后降级火山/本地/硅基 |
 
 ## DoD
 - `npm run build` 通过。
@@ -20,4 +22,6 @@
 - `cargo fmt --check` 通过。
 - `cargo check` 通过。
 - `cargo test` 通过。
-- 本地 runtime 启动后可通过 `local_hybrid` 走实时 partial 与 final 插入。
+- `auto_optimized` 可作为默认 ASR Provider，不把 `。`、空文本、日文/韩文错判插入目标 App。
+- 本地模型下载后可通过 `local_hybrid` 作为云端失败 fallback。
+- 不改用户快捷键，不把旧 Qwen 1.7B 作为默认迁移目标。
