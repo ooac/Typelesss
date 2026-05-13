@@ -42,6 +42,12 @@ pub struct AppConfig {
     pub volcengine_app_id: String,
     pub volcengine_access_token: String,
     pub volcengine_resource_id: String,
+    #[serde(default)]
+    pub tencent_app_id: String,
+    #[serde(default)]
+    pub tencent_secret_id: String,
+    #[serde(default)]
+    pub tencent_secret_key: String,
     pub polish_provider: String,
     pub polish_endpoint: String,
     pub polish_api_key: String,
@@ -83,6 +89,9 @@ impl Default for AppConfig {
             volcengine_app_id: String::new(),
             volcengine_access_token: String::new(),
             volcengine_resource_id: String::new(),
+            tencent_app_id: String::new(),
+            tencent_secret_id: String::new(),
+            tencent_secret_key: String::new(),
             polish_provider: "openai_compatible".to_string(),
             polish_endpoint: DEFAULT_DEEPSEEK_POLISH_ENDPOINT.to_string(),
             polish_api_key: String::new(),
@@ -119,6 +128,7 @@ pub fn save_config_to_disk(config: &AppConfig) -> Result<()> {
         &config.asr_api_key,
         &config.polish_api_key,
         &config.volcengine_access_token,
+        &config.tencent_secret_key,
     )?;
 
     let path = config_path()?;
@@ -130,6 +140,7 @@ pub fn save_config_to_disk(config: &AppConfig) -> Result<()> {
     safe_config.asr_api_key.clear();
     safe_config.polish_api_key.clear();
     safe_config.volcengine_access_token.clear();
+    safe_config.tencent_secret_key.clear();
 
     let content = serde_json::to_string_pretty(&safe_config)?;
     fs::write(&path, content).with_context(|| format!("无法写入配置文件：{}", path.display()))?;
@@ -158,6 +169,9 @@ fn migrate_legacy_defaults(config: &mut AppConfig) {
     }
     if config.polish_model.trim() == LEGACY_OPENAI_POLISH_MODEL {
         config.polish_model = DEFAULT_DEEPSEEK_POLISH_MODEL.to_string();
+    }
+    if config.asr_provider == "tencent_realtime" && config.asr_model.trim() == "16k_zh_en" {
+        config.asr_model = "16k_zh".to_string();
     }
 
     // Build a default preset from legacy hotkey/output_mode if presets are missing.
@@ -198,6 +212,7 @@ fn default_local_asr_engine_id() -> String {
 fn default_asr_provider_candidates() -> Vec<String> {
     vec![
         "alibaba_paraformer_realtime".to_string(),
+        "tencent_realtime".to_string(),
         "volcengine".to_string(),
         "local_hybrid".to_string(),
         "whisper_compatible".to_string(),
@@ -265,6 +280,9 @@ mod tests {
             "volcengineAppId": "",
             "volcengineAccessToken": "",
             "volcengineResourceId": "",
+            "tencentAppId": "",
+            "tencentSecretId": "",
+            "tencentSecretKey": "",
             "polishProvider": "openai_compatible",
             "polishEndpoint": DEFAULT_DEEPSEEK_POLISH_ENDPOINT,
             "polishApiKey": "",
@@ -287,6 +305,9 @@ mod tests {
             "volcengineAppId": "",
             "volcengineAccessToken": "",
             "volcengineResourceId": "",
+            "tencentAppId": "",
+            "tencentSecretId": "",
+            "tencentSecretKey": "",
             "polishProvider": "openai_compatible",
             "polishEndpoint": DEFAULT_DEEPSEEK_POLISH_ENDPOINT,
             "polishApiKey": "",

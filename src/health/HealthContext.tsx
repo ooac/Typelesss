@@ -22,6 +22,7 @@ const DEFAULT_SECRETS: SecretStatus = {
   asrApiKey: false,
   polishApiKey: false,
   volcengineAccessToken: false,
+  tencentSecretKey: false,
 };
 
 const POLL_INTERVAL_MS = 30_000;
@@ -88,6 +89,9 @@ export function HealthProvider({ children }: { children: ReactNode }) {
     config.volcengineAppId,
     config.volcengineResourceId,
     config.volcengineAccessToken,
+    config.tencentAppId,
+    config.tencentSecretId,
+    config.tencentSecretKey,
   ]);
 
   return (

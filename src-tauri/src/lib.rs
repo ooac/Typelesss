@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tauri_plugin_sql::{Migration, MigrationKind};
@@ -98,7 +99,7 @@ struct SaveBenchmarkSamplePayload {
     category: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProviderScore {
     provider_id: String,
@@ -110,6 +111,12 @@ struct ProviderScore {
     tech_term_recall: f64,
     sample_count: u64,
     updated_at: u64,
+}
+
+#[derive(Debug)]
+struct BenchmarkAudioSample {
+    expected_text: String,
+    audio_path: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -563,6 +570,7 @@ fn start_auto_asr_session(config: AppConfig) -> Result<AutoAsrSessionInfo, Strin
     let candidates = if config.asr_provider_candidates.is_empty() {
         vec![
             "alibaba_paraformer_realtime".to_string(),
+            "tencent_realtime".to_string(),
             "volcengine".to_string(),
             "local_hybrid".to_string(),
             "whisper_compatible".to_string(),
@@ -588,7 +596,10 @@ fn start_auto_asr_session(config: AppConfig) -> Result<AutoAsrSessionInfo, Strin
 }
 
 #[tauri::command]
-fn list_provider_scores() -> Result<Vec<ProviderScore>, String> {
+fn list_provider_scores(app: AppHandle) -> Result<Vec<ProviderScore>, String> {
+    if let Some(scores) = load_provider_scores(&app) {
+        return Ok(scores);
+    }
     let now = current_timestamp_ms();
     Ok(vec![
         ProviderScore {
@@ -614,6 +625,17 @@ fn list_provider_scores() -> Result<Vec<ProviderScore>, String> {
             updated_at: now,
         },
         ProviderScore {
+            provider_id: "tencent_realtime".to_string(),
+            score: 0.0,
+            p50_first_partial_ms: None,
+            p95_first_partial_ms: None,
+            p50_final_ms: None,
+            error_rate: 0.0,
+            tech_term_recall: 0.0,
+            sample_count: 0,
+            updated_at: now,
+        },
+        ProviderScore {
             provider_id: "local_hybrid".to_string(),
             score: 0.0,
             p50_first_partial_ms: None,
@@ -628,8 +650,103 @@ fn list_provider_scores() -> Result<Vec<ProviderScore>, String> {
 }
 
 #[tauri::command]
-fn run_provider_benchmark() -> Result<Vec<ProviderScore>, String> {
-    list_provider_scores()
+async fn run_provider_benchmark(app: AppHandle) -> Result<Vec<ProviderScore>, String> {
+    let samples = load_benchmark_audio_samples(&app)?;
+    if samples.is_empty() {
+        return Err("缺少真实评测音频。请先保存包含 audioPath 的 benchmark 样本。".to_string());
+    }
+
+    let base_config = load_config_from_disk().map_err(|err| err.to_string())?;
+    let mut scores = Vec::new();
+    for provider_id in [
+        "tencent_realtime",
+        "volcengine",
+        "local_hybrid",
+        "whisper_compatible",
+    ] {
+        scores.push(run_provider_benchmark_candidate(&base_config, provider_id, &samples).await);
+    }
+    save_provider_scores(&app, &scores)?;
+    Ok(scores)
+}
+
+async fn run_provider_benchmark_candidate(
+    base_config: &AppConfig,
+    provider_id: &str,
+    samples: &[BenchmarkAudioSample],
+) -> ProviderScore {
+    let mut latencies = Vec::new();
+    let mut error_count = 0u64;
+    let mut cer_sum = 0.0f64;
+    let mut recall_sum = 0.0f64;
+
+    for sample in samples {
+        let mut config = base_config.clone();
+        config.asr_provider = provider_id.to_string();
+        if provider_id == "tencent_realtime" {
+            error_count += 1;
+            cer_sum += 1.0;
+            recall_sum += 0.0;
+            continue;
+        }
+        if provider_id == "whisper_compatible" {
+            if config.asr_endpoint.trim().is_empty()
+                || config.asr_endpoint.starts_with("ws://")
+                || config.asr_endpoint.starts_with("wss://")
+            {
+                config.asr_endpoint =
+                    "https://api.siliconflow.cn/v1/audio/transcriptions".to_string();
+            }
+            if config.asr_model.trim().is_empty()
+                || config.asr_model.trim() == "paraformer-realtime-v2"
+            {
+                config.asr_model = "FunAudioLLM/SenseVoiceSmall".to_string();
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            providers::transcribe_audio(&config, &sample.audio_path),
+        )
+        .await;
+        let latency = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+
+        match result {
+            Ok(Ok(text)) => {
+                latencies.push(latency);
+                cer_sum += character_error_rate(&sample.expected_text, &text);
+                recall_sum += technical_term_recall(&sample.expected_text, &text);
+            }
+            Ok(Err(_)) | Err(_) => {
+                error_count += 1;
+                cer_sum += 1.0;
+                recall_sum += 0.0;
+            }
+        }
+    }
+
+    latencies.sort_unstable();
+    let sample_count = samples.len() as u64;
+    let error_rate = error_count as f64 / sample_count.max(1) as f64;
+    let cer = cer_sum / sample_count.max(1) as f64;
+    let tech_term_recall = recall_sum / sample_count.max(1) as f64;
+    let latency_penalty = percentile(&latencies, 50).unwrap_or(30_000) as f64 / 30_000.0;
+    let score = ((1.0 - cer).max(0.0) * 0.52 + tech_term_recall * 0.28 + (1.0 - error_rate) * 0.2)
+        * 100.0
+        - latency_penalty * 10.0;
+
+    ProviderScore {
+        provider_id: provider_id.to_string(),
+        score: score.max(0.0),
+        p50_first_partial_ms: None,
+        p95_first_partial_ms: None,
+        p50_final_ms: percentile(&latencies, 50),
+        error_rate,
+        tech_term_recall,
+        sample_count,
+        updated_at: current_timestamp_ms(),
+    }
 }
 
 #[tauri::command]
@@ -664,6 +781,149 @@ fn save_benchmark_sample(
     )
     .map_err(|err| format!("无法写入评测样本：{err}"))?;
     Ok(id)
+}
+
+fn load_benchmark_audio_samples(app: &AppHandle) -> Result<Vec<BenchmarkAudioSample>, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("无法定位 App data 目录：{err}"))?
+        .join("asr-benchmark-samples");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(format!("无法读取评测样本目录：{err}")),
+    };
+
+    let mut samples = Vec::new();
+    for entry in entries.flatten() {
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
+        let expected_text = value
+            .get("expectedText")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let audio_path = value
+            .get("audioPath")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if expected_text.is_empty()
+            || audio_path.is_empty()
+            || !std::path::Path::new(&audio_path).is_file()
+        {
+            continue;
+        }
+        samples.push(BenchmarkAudioSample {
+            expected_text,
+            audio_path,
+        });
+    }
+    Ok(samples)
+}
+
+fn provider_scores_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("无法定位 App data 目录：{err}"))?
+        .join("asr-provider-scores.json"))
+}
+
+fn load_provider_scores(app: &AppHandle) -> Option<Vec<ProviderScore>> {
+    let path = provider_scores_path(app).ok()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<Vec<ProviderScore>>(&content).ok()
+}
+
+fn save_provider_scores(app: &AppHandle, scores: &[ProviderScore]) -> Result<(), String> {
+    let path = provider_scores_path(app)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("无法创建 provider 评分目录：{err}"))?;
+    }
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(scores)
+            .map_err(|err| format!("无法编码 provider 评分：{err}"))?,
+    )
+    .map_err(|err| format!("无法写入 provider 评分：{err}"))
+}
+
+fn percentile(values: &[u64], percentile: u64) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    let rank = ((values.len() - 1) as f64 * (percentile as f64 / 100.0)).round() as usize;
+    values.get(rank).copied()
+}
+
+fn character_error_rate(reference: &str, hypothesis: &str) -> f64 {
+    let reference_chars = reference.chars().collect::<Vec<_>>();
+    let hypothesis_chars = hypothesis.chars().collect::<Vec<_>>();
+    if reference_chars.is_empty() {
+        return if hypothesis_chars.is_empty() {
+            0.0
+        } else {
+            1.0
+        };
+    }
+    levenshtein_distance(&reference_chars, &hypothesis_chars) as f64 / reference_chars.len() as f64
+}
+
+fn technical_term_recall(reference: &str, hypothesis: &str) -> f64 {
+    let terms = [
+        "Claude Code",
+        "OpenAI Codex",
+        "Tauri",
+        "src-tauri",
+        "TranscriptEvent",
+        "ShadowBuffer",
+        "TypeScript",
+        "Rust",
+        "React",
+        "Vite",
+        "GPT",
+    ];
+    let expected = terms
+        .iter()
+        .filter(|term| reference.to_lowercase().contains(&term.to_lowercase()))
+        .collect::<Vec<_>>();
+    if expected.is_empty() {
+        return 1.0;
+    }
+    let lower = hypothesis.to_lowercase();
+    let hits = expected
+        .iter()
+        .filter(|term| lower.contains(&term.to_lowercase()))
+        .count();
+    hits as f64 / expected.len() as f64
+}
+
+fn levenshtein_distance<T: Eq>(left: &[T], right: &[T]) -> usize {
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+    for (i, left_item) in left.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, right_item) in right.iter().enumerate() {
+            let cost = usize::from(left_item != right_item);
+            current[j + 1] = (previous[j + 1] + 1)
+                .min(current[j] + 1)
+                .min(previous[j] + cost);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
 }
 
 #[tauri::command]

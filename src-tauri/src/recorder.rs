@@ -13,11 +13,17 @@ use crate::providers::RealtimeAsrCommand;
 const ASR_SAMPLE_RATE: u32 = 16_000;
 const REALTIME_CHUNK_MS: u32 = 40;
 const ASR_LEADING_SILENCE_MS: u32 = 240;
+const ASR_SEGMENT_PREROLL_MS: u32 = 320;
+const ASR_SEGMENT_SILENCE_MS: u32 = 220;
 const INPUT_WARM_UP_MS: u64 = 900;
 const REALTIME_CHUNK_SAMPLES: usize =
     (ASR_SAMPLE_RATE as usize * REALTIME_CHUNK_MS as usize) / 1000;
 const ASR_LEADING_SILENCE_SAMPLES: usize =
     (ASR_SAMPLE_RATE as usize * ASR_LEADING_SILENCE_MS as usize) / 1000;
+const ASR_SEGMENT_PREROLL_SAMPLES: usize =
+    (ASR_SAMPLE_RATE as usize * ASR_SEGMENT_PREROLL_MS as usize) / 1000;
+const ASR_SEGMENT_SILENCE_SAMPLES: usize =
+    (ASR_SAMPLE_RATE as usize * ASR_SEGMENT_SILENCE_MS as usize) / 1000;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +32,15 @@ pub struct RecordingResult {
     pub duration_ms: f64,
     pub sample_rate: u32,
     pub samples: usize,
+    pub audio_quality: AudioQuality,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioQuality {
+    pub rms_db: f32,
+    pub peak: f32,
+    pub audible_ratio: f32,
 }
 
 enum RecorderCommand {
@@ -227,6 +242,7 @@ fn stop_session(session: RecorderSession) -> Result<RecordingResult> {
     let wav_path = path.with_extension("wav");
     let mono_samples = downmix_to_mono(&samples, session.channels);
     let asr_samples = resample_linear(&mono_samples, session.sample_rate, ASR_SAMPLE_RATE);
+    let audio_quality = analyze_audio_quality(&asr_samples);
     let asr_samples = with_leading_silence(&asr_samples);
     write_wav(&wav_path, ASR_SAMPLE_RATE, 1, &asr_samples)?;
 
@@ -235,6 +251,7 @@ fn stop_session(session: RecorderSession) -> Result<RecordingResult> {
         duration_ms,
         sample_rate: ASR_SAMPLE_RATE,
         samples: asr_samples.len(),
+        audio_quality,
     })
 }
 
@@ -290,6 +307,9 @@ struct RealtimeChunker {
     source_rate: u32,
     channels: u16,
     pending: Vec<i16>,
+    pre_roll: Vec<i16>,
+    speech_active: bool,
+    silent_samples: usize,
     tx: UnboundedSender<RealtimeAsrCommand>,
 }
 
@@ -299,6 +319,9 @@ impl RealtimeChunker {
             source_rate,
             channels,
             pending: vec![0; ASR_LEADING_SILENCE_SAMPLES],
+            pre_roll: Vec::with_capacity(ASR_SEGMENT_PREROLL_SAMPLES),
+            speech_active: false,
+            silent_samples: ASR_SEGMENT_SILENCE_SAMPLES,
             tx,
         }
     }
@@ -310,7 +333,15 @@ impl RealtimeChunker {
 
         let mono_samples = downmix_to_mono(interleaved_samples, self.channels);
         let asr_samples = resample_linear(&mono_samples, self.source_rate, ASR_SAMPLE_RATE);
+        let segment_start = frame_is_audible(&asr_samples)
+            && !self.speech_active
+            && self.silent_samples >= ASR_SEGMENT_SILENCE_SAMPLES
+            && !self.pre_roll.is_empty();
+        if segment_start {
+            self.pending.extend_from_slice(&self.pre_roll);
+        }
         self.pending.extend(asr_samples);
+        self.update_speech_state_and_preroll();
 
         while self.pending.len() >= REALTIME_CHUNK_SAMPLES {
             let chunk = self
@@ -320,6 +351,41 @@ impl RealtimeChunker {
             if self.tx.send(RealtimeAsrCommand::Audio(chunk)).is_err() {
                 self.pending.clear();
                 break;
+            }
+        }
+    }
+
+    fn update_speech_state_and_preroll(&mut self) {
+        let inspect_from = self.pending.len().saturating_sub(REALTIME_CHUNK_SAMPLES);
+        let recent = &self.pending[inspect_from..];
+        if frame_is_audible(recent) {
+            self.speech_active = true;
+            self.silent_samples = 0;
+        } else {
+            self.silent_samples = self.silent_samples.saturating_add(recent.len());
+            if self.silent_samples >= ASR_SEGMENT_SILENCE_SAMPLES {
+                self.speech_active = false;
+            }
+        }
+
+        self.pre_roll.extend_from_slice(recent);
+        if self.pre_roll.len() > ASR_SEGMENT_PREROLL_SAMPLES {
+            let drop_len = self.pre_roll.len() - ASR_SEGMENT_PREROLL_SAMPLES;
+            self.pre_roll.drain(..drop_len);
+        }
+    }
+}
+
+impl Drop for RealtimeChunker {
+    fn drop(&mut self) {
+        if self.pending.iter().any(|sample| *sample != 0) {
+            let mut chunk = std::mem::take(&mut self.pending);
+            let remainder = chunk.len() % REALTIME_CHUNK_SAMPLES;
+            if remainder != 0 {
+                chunk.resize(chunk.len() + (REALTIME_CHUNK_SAMPLES - remainder), 0);
+            }
+            for part in chunk.chunks(REALTIME_CHUNK_SAMPLES) {
+                let _ = self.tx.send(RealtimeAsrCommand::Audio(part.to_vec()));
             }
         }
     }
@@ -366,6 +432,42 @@ fn downmix_to_mono(samples: &[i16], channels: u16) -> Vec<i16> {
             (sum / frame.len() as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16
         })
         .collect()
+}
+
+fn frame_is_audible(samples: &[i16]) -> bool {
+    if samples.is_empty() {
+        return false;
+    }
+    let quality = analyze_audio_quality(samples);
+    quality.peak >= 0.012 && quality.rms_db >= -48.0 && quality.audible_ratio >= 0.01
+}
+
+fn analyze_audio_quality(samples: &[i16]) -> AudioQuality {
+    if samples.is_empty() {
+        return AudioQuality {
+            rms_db: -120.0,
+            peak: 0.0,
+            audible_ratio: 0.0,
+        };
+    }
+
+    let mut sum_square = 0.0f64;
+    let mut peak = 0.0f32;
+    let mut audible = 0usize;
+    for sample in samples {
+        let value = (*sample as f32 / i16::MAX as f32).abs();
+        peak = peak.max(value);
+        sum_square += f64::from(value * value);
+        if value >= 0.01 {
+            audible += 1;
+        }
+    }
+    let rms = (sum_square / samples.len() as f64).sqrt().max(0.000_001);
+    AudioQuality {
+        rms_db: (20.0 * rms.log10()) as f32,
+        peak,
+        audible_ratio: audible as f32 / samples.len() as f32,
+    }
 }
 
 fn resample_linear(samples: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
@@ -416,5 +518,28 @@ mod tests {
             .iter()
             .all(|sample| *sample == 0));
         assert_eq!(&output[ASR_LEADING_SILENCE_SAMPLES..], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn analyzes_audio_quality() {
+        let quality = analyze_audio_quality(&[0, 8000, -8000, 0]);
+        assert!(quality.peak > 0.2);
+        assert!(quality.rms_db > -20.0);
+        assert!(quality.audible_ratio >= 0.5);
+    }
+
+    #[test]
+    fn flushes_realtime_tail_on_drop() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut chunker = RealtimeChunker::new(ASR_SAMPLE_RATE, 1, tx);
+            chunker.pending.clear();
+            chunker.push(&[1000; 12]);
+        }
+        let message = rx.try_recv().expect("tail chunk should be flushed");
+        match message {
+            RealtimeAsrCommand::Audio(samples) => assert_eq!(samples.len(), REALTIME_CHUNK_SAMPLES),
+            _ => panic!("expected audio chunk"),
+        }
     }
 }

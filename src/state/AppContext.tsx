@@ -35,6 +35,8 @@ import {
   recordAsrTelemetry,
   upsertPersonalTerm,
 } from "../db/historyRepo.js";
+import { chooseBestTranscript, chooseRealtimeFinalCandidate } from "../asr/finalCandidateGuard.js";
+import { isRealtimeAsrProvider, latestRealtimeText } from "../asr/realtimeProviders.js";
 import { formatHotkey } from "../hotkey.js";
 import { normalizeFast, validatePolishOutput } from "../index.js";
 import { TranscriptStabilizer } from "../realtime/stabilizer.js";
@@ -79,10 +81,6 @@ interface ShortcutTogglePayload {
   shortcut?: string;
 }
 
-const REALTIME_ASR_PROVIDERS = new Set<AppConfig["asrProvider"]>([
-  "auto_optimized",
-  "stepfun_streaming",
-]);
 const REALTIME_TERMS = [
   "Claude Code",
   "OpenAI Codex",
@@ -159,6 +157,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const personalTermsRef = useRef<string[]>([]);
   const correctionEntriesRef = useRef<DictionaryEntry[]>([]);
   const sessionTelemetryRef = useRef<SessionTelemetryDraft | null>(null);
+  const idleResetTimerRef = useRef<number | null>(null);
   /**
    * Tracks which preset is driving the *current* recording session so that
    * `stopAndProcess` uses its outputMode even if the user changes the active
@@ -178,6 +177,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const setIsHotkeyCapture = useCallback((capturing: boolean) => {
     isHotkeyCaptureRef.current = capturing;
+  }, []);
+
+  const clearIdleResetTimer = useCallback(() => {
+    if (idleResetTimerRef.current !== null) {
+      window.clearTimeout(idleResetTimerRef.current);
+      idleResetTimerRef.current = null;
+    }
   }, []);
 
   const findPresetByShortcut = useCallback((shortcut: string | undefined): Preset | null => {
@@ -270,6 +276,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
         const output = realtimeStabilizerRef.current.onPartial(payload.text);
         const previewText = output.previewText || payload.text;
         streamingPreviewRef.current = previewText;
+        streamingFinalRef.current = previewText;
+        streamingErrorRef.current = "";
+        setError("");
         setRawText(previewText);
         setNormalizedText(output.stableText || previewText);
         setFinalText(previewText);
@@ -289,6 +298,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
         }
         setNormalizedText(payload.text);
         streamingPreviewRef.current = payload.text;
+        streamingFinalRef.current = payload.text;
+        streamingErrorRef.current = "";
+        setError("");
         if (payload.text && payload.text !== liveStableTextRef.current) {
           void applyLiveComposition(payload.text, "stable", compositionSessionRef, liveStableTextRef, liveInsertFailedRef, sessionTelemetryRef);
         }
@@ -304,6 +316,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
         const text = output.previewText;
         streamingPreviewRef.current = text;
         streamingFinalRef.current = text;
+        streamingErrorRef.current = "";
+        setError("");
         setRawText(text);
         setNormalizedText(text);
         setFinalText(text);
@@ -316,6 +330,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
       if (payload.kind === "error") {
         const message = payload.errorMessage || "实时 ASR 失败";
         streamingErrorRef.current = message;
+        const fallbackText = latestRealtimeText(streamingFinalRef.current, streamingPreviewRef.current);
+        if (fallbackText.trim()) {
+          setStatus(`实时 ASR 连接结束，已使用当前文本继续：${message}`);
+          const waiters = streamingFinalWaitersRef.current.splice(0);
+          waiters.forEach((resolve) => resolve(fallbackText));
+          return;
+        }
         setError(message);
         setStatus(
           configRef.current.asrProvider === "auto_optimized"
@@ -352,7 +373,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
       return;
     }
     try {
-      const current = configRef.current;
+      const current = normalizeShortcutConfig(configRef.current, {
+        hotkey: configRef.current.hotkey,
+        outputMode: configRef.current.outputMode,
+      });
       await invoke<string>("save_config", { config: current });
       setConfig(current);
       setError("");
@@ -371,7 +395,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const updateAndSaveConfig = useCallback(
     async (patch: Partial<AppConfig>) => {
-      const next = { ...configRef.current, ...patch };
+      const next = normalizeShortcutConfig(configRef.current, patch);
       setConfig(next);
       if (!isTauriRuntime) return;
       try {
@@ -431,6 +455,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setStatus("浏览器预览模式无法调用系统录音。");
       return;
     }
+    clearIdleResetTimer();
     setError("");
     setRawText("");
     setNormalizedText("");
@@ -451,7 +476,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       (p) => p.id === configRef.current.activePresetId,
     );
     if (active) sessionPresetIdRef.current = active.id;
-    const supportsRealtimeAsr = REALTIME_ASR_PROVIDERS.has(configRef.current.asrProvider);
+    const supportsRealtimeAsr = isRealtimeAsrProvider(configRef.current.asrProvider);
     setStatus(
       supportsRealtimeAsr
         ? "实时 ASR 已启动，正在监听。"
@@ -498,15 +523,51 @@ export function AppProvider({ children }: { children: ReactNode }) {
         "停止录音",
       );
       recordingForCleanup = recording;
+      if (recording.audioQuality.peak < 0.012 || recording.audioQuality.audibleRatio < 0.01) {
+        setStatus(
+          `录音音量偏低：peak ${recording.audioQuality.peak.toFixed(3)}，有效语音 ${(recording.audioQuality.audibleRatio * 100).toFixed(1)}%。`,
+        );
+      }
       let transcript = "";
-      if (REALTIME_ASR_PROVIDERS.has(activeConfig.asrProvider)) {
+      if (isRealtimeAsrProvider(activeConfig.asrProvider)) {
         setStatus("正在等待实时 ASR final。");
-        transcript = streamingFinalRef.current || (await waitForStreamingFinal(streamingFinalWaitersRef, streamingFinalRef, 1_500));
+        const existingRealtimeText = latestRealtimeText(streamingFinalRef.current, streamingPreviewRef.current);
+        const realtimeFinal =
+          existingRealtimeText ||
+          (await waitForStreamingFinal(streamingFinalWaitersRef, streamingFinalRef, 1_500)) ||
+          latestRealtimeText(streamingFinalRef.current, streamingPreviewRef.current);
+        const realtimeDecision = chooseRealtimeFinalCandidate(realtimeFinal, streamingPreviewRef.current, recording.durationMs);
+        transcript = realtimeDecision.text;
         if (!transcript.trim() && streamingErrorRef.current && activeConfig.asrProvider !== "auto_optimized") {
           throw new Error(streamingErrorRef.current);
         }
         if (!transcript.trim() && streamingErrorRef.current) {
           setStatus("实时 ASR 没有可用 final，正在切换自动候选。");
+        } else if (activeConfig.asrProvider === "auto_optimized" && realtimeDecision.needsFullAudioReview) {
+          setStatus(`实时 final 疑似不完整（${realtimeDecision.reason}），正在用完整录音复核。`);
+          try {
+            const reviewed = await withTimeout(
+              invoke<string>("transcribe_audio", {
+                config: activeConfig,
+                wavPath: recording.wavPath,
+              }),
+              Math.min(30_000, Math.max(8_000, Math.ceil(recording.durationMs * 4 + 4_000))),
+              "完整录音复核",
+            );
+            transcript = chooseBestTranscript(transcript, reviewed);
+            sessionTelemetryRef.current = {
+              ...(sessionTelemetryRef.current ?? makeTelemetryDraft()),
+              finalReceivedAt: Date.now(),
+            };
+          } catch (err) {
+            console.warn("full audio review failed, using realtime candidate:", err);
+          }
+        }
+      }
+      if (!transcript.trim()) {
+        const realtimeFallback = latestRealtimeText(streamingFinalRef.current, streamingPreviewRef.current);
+        if (isRealtimeAsrProvider(activeConfig.asrProvider) && realtimeFallback.trim()) {
+          transcript = realtimeFallback;
         }
       }
       if (!transcript.trim()) {
@@ -665,13 +726,53 @@ export function AppProvider({ children }: { children: ReactNode }) {
         }
       })();
 
-      setTimeout(() => {
+      clearIdleResetTimer();
+      idleResetTimerRef.current = window.setTimeout(() => {
+        idleResetTimerRef.current = null;
+        if (stateRef.current !== "inserted") return;
         setRecordingStartedAt(null);
         setRuntimeState("idle");
       }, 900);
     } catch (err) {
-      setRuntimeState("error");
       const message = String(err);
+      const realtimeFallback = latestRealtimeText(streamingFinalRef.current, streamingPreviewRef.current);
+      if (isRealtimeAsrProvider(configRef.current.asrProvider) && realtimeFallback && isRecoverableRealtimeAsrFailure(message)) {
+        try {
+          const activeConfig = configRef.current;
+          const activePreset =
+            activeConfig.presets.find((p) => p.id === sessionPresetIdRef.current) ??
+            activeConfig.presets.find((p) => p.id === activeConfig.activePresetId) ??
+            activeConfig.presets[0];
+          const candidate = normalizeFast(realtimeFallback, {
+            mode: activePreset?.outputMode ?? activeConfig.outputMode,
+            dictionaryEntries: [
+              ...correctionEntriesRef.current,
+              ...personalDictionaryEntries(personalTermsRef.current),
+            ],
+          });
+          const finalFallback = candidate.normalizedText;
+          setError("");
+          setRawText(realtimeFallback);
+          setNormalizedText(candidate.normalizedText);
+          setFinalText(finalFallback);
+          const deliveryMessage = activeConfig.autoInsert
+            ? await withTimeout(invoke<string>("paste_text", { text: finalFallback }), 8_000, "插入实时文本")
+            : (await withTimeout(invoke("copy_text", { text: finalFallback }), 5_000, "复制实时文本"), "文本已复制到剪贴板。");
+          setRuntimeState("inserted");
+          setStatus(`完成。${deliveryMessage} 已使用实时 ASR 当前文本兜底，未走 batch。`);
+          clearIdleResetTimer();
+          idleResetTimerRef.current = window.setTimeout(() => {
+            idleResetTimerRef.current = null;
+            if (stateRef.current !== "inserted") return;
+            setRecordingStartedAt(null);
+            setRuntimeState("idle");
+          }, 900);
+          return;
+        } catch (recoveryErr) {
+          console.warn("realtime fallback insert failed:", recoveryErr);
+        }
+      }
+      setRuntimeState("error");
       setError(message);
       setRecordingStartedAt(null);
       setStatus(processingFailureStatus(message));
@@ -682,10 +783,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
         });
       }
     }
-  }, [isTauriRuntime, setRuntimeState]);
+  }, [clearIdleResetTimer, isTauriRuntime, setRuntimeState]);
 
   const cancelRecording = useCallback(async () => {
     if (!isTauriRuntime) return;
+    clearIdleResetTimer();
     await invoke("cancel_recording").catch(() => undefined);
     if (compositionSessionRef.current) {
       await invoke("cancel_composition", { sessionId: compositionSessionRef.current }).catch(() => undefined);
@@ -696,7 +798,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setRecordingStartedAt(null);
     setRuntimeState("idle");
     setStatus("已取消。");
-  }, [isTauriRuntime, setRuntimeState]);
+  }, [clearIdleResetTimer, isTauriRuntime, setRuntimeState]);
 
   const clearTranscript = useCallback(() => {
     setRawText("");
@@ -873,6 +975,10 @@ function processingFailureStatus(message: string) {
   return "处理失败，文本未插入。";
 }
 
+function isRecoverableRealtimeAsrFailure(message: string): boolean {
+  return /ASR|batch|final|realtime|实时|腾讯云|转写|未返回/u.test(message);
+}
+
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   return new Promise((resolve, reject) => {
     const timer = window.setTimeout(() => {
@@ -987,4 +1093,24 @@ function personalDictionaryEntries(terms: string[]): DictionaryEntry[] {
       category: "coding",
       language: /[\u3400-\u9fff]/u.test(term) ? "zh" : "mixed",
     }));
+}
+
+function normalizeShortcutConfig(current: AppConfig, patch: Partial<AppConfig>): AppConfig {
+  const next = { ...current, ...patch };
+  const presets = Array.isArray(next.presets) ? next.presets.map((preset) => ({ ...preset })) : [];
+  const activeIndex = presets.findIndex((preset) => preset.id === next.activePresetId);
+  if (activeIndex < 0) return next;
+
+  const patchHasHotkey = Object.prototype.hasOwnProperty.call(patch, "hotkey");
+  const patchHasOutputMode = Object.prototype.hasOwnProperty.call(patch, "outputMode");
+  if (patchHasHotkey) presets[activeIndex].hotkey = next.hotkey;
+  if (patchHasOutputMode) presets[activeIndex].outputMode = next.outputMode;
+
+  const active = presets[activeIndex];
+  return {
+    ...next,
+    presets,
+    hotkey: active.hotkey || next.hotkey,
+    outputMode: active.outputMode || next.outputMode,
+  };
 }

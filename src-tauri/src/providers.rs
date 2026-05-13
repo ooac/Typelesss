@@ -5,9 +5,11 @@ use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use futures_util::{Sink, SinkExt, StreamExt};
+use hmac::{Hmac, Mac};
 use reqwest::multipart::{Form, Part};
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha1::Sha1;
 use std::{
     fs,
     io::{Read, Write},
@@ -26,6 +28,8 @@ const ASR_HTTP_TIMEOUT: Duration = Duration::from_secs(25);
 const POLISH_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 const ALIBABA_PARA_FORMER_ENDPOINT: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference/";
 const ALIBABA_PARA_FORMER_MODEL: &str = "paraformer-realtime-v2";
+const TENCENT_REALTIME_ENDPOINT: &str = "wss://asr.cloud.tencent.com/asr/v2";
+const TENCENT_REALTIME_MODEL: &str = "16k_zh";
 const STEPFUN_STREAM_ENDPOINT: &str = "wss://api.stepfun.com/v1/realtime/asr/stream";
 const STEPFUN_STREAM_MODEL: &str = "step-asr-1.1-stream";
 const REALTIME_FINAL_WAIT: Duration = Duration::from_millis(1200);
@@ -38,6 +42,9 @@ pub async fn transcribe_audio(config: &AppConfig, wav_path: &str) -> Result<Stri
         "auto_optimized" => transcribe_auto_optimized(config, wav_path).await,
         "whisper_compatible" => transcribe_whisper_compatible(config, wav_path).await,
         "volcengine" => transcribe_volcengine_streaming(config, wav_path).await,
+        "tencent_realtime" => Err(anyhow!(
+            "腾讯云实时 ASR 未返回 final，不能走 batch 转写。请检查实时连接或切回自动候选。"
+        )),
         "local_hybrid" => transcribe_local_hybrid(config, wav_path).await,
         "stepfun_streaming" => Err(anyhow!(
             "StepFun 实时 ASR 未返回 final，不能走 batch 转写。请检查实时连接或切回硅基流动 fallback。"
@@ -84,6 +91,7 @@ pub fn start_realtime_asr(
                 start_alibaba_paraformer_realtime_asr(app.clone(), config).map(Some)
             }
         }
+        "tencent_realtime" => start_tencent_realtime_asr(app.clone(), config).map(Some),
         "stepfun_streaming" => start_stepfun_realtime_asr(app.clone(), config).map(Some),
         "local_hybrid" => Ok(None),
         _ => Ok(None),
@@ -295,7 +303,13 @@ fn start_alibaba_paraformer_realtime_asr(
                         "format": "pcm",
                         "sample_rate": 16000,
                         "disfluency_removal_enabled": false,
-                        "language_hints": ["zh", "en"]
+                        "language_hints": ["zh", "en"],
+                        "semantic_punctuation_enabled": false,
+                        "punctuation_prediction_enabled": true,
+                        "inverse_text_normalization_enabled": true,
+                        "max_sentence_silence": 2500,
+                        "multi_threshold_mode_enabled": true,
+                        "heartbeat": true
                     },
                     "input": {}
                 }
@@ -427,6 +441,161 @@ fn start_alibaba_paraformer_realtime_asr(
     Ok(tx)
 }
 
+fn start_tencent_realtime_asr(
+    app: AppHandle,
+    config: &AppConfig,
+) -> Result<UnboundedSender<RealtimeAsrCommand>> {
+    let app_id = config.tencent_app_id.trim().to_string();
+    let secret_id = config.tencent_secret_id.trim().to_string();
+    let secret_key = secret_store::resolve_tencent_secret_key(&config.tencent_secret_key);
+    if app_id.is_empty() || secret_id.is_empty() || secret_key.trim().is_empty() {
+        return Err(anyhow!("请先填写腾讯云 AppID / SecretID / SecretKey"));
+    }
+
+    let model = if config.asr_model.trim().is_empty()
+        || config.asr_model.trim() == ALIBABA_PARA_FORMER_MODEL
+        || config.asr_model.trim().eq_ignore_ascii_case("16k_zh_en")
+    {
+        TENCENT_REALTIME_MODEL.to_string()
+    } else {
+        config.asr_model.trim().to_string()
+    };
+    let endpoint = tencent_realtime_endpoint_or_default(&config.asr_endpoint);
+    let voice_id = tencent_voice_id();
+    let url = build_tencent_realtime_url(
+        &endpoint,
+        &app_id,
+        &secret_id,
+        secret_key.trim(),
+        &model,
+        &voice_id,
+    )?;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let provider_id = "tencent_realtime".to_string();
+    let (tx, mut rx) = mpsc::unbounded_channel::<RealtimeAsrCommand>();
+
+    tauri::async_runtime::spawn(async move {
+        let result: Result<()> = async {
+            let (mut ws, _) = connect_async(url)
+                .await
+                .context("无法连接腾讯云实时 ASR。请检查服务是否已开通、AppID/SecretID/SecretKey 是否匹配、模型是否已购买；当前默认用 16k_zh 做基础连通验证")?;
+            let mut best_text = String::new();
+            let mut committed_at: Option<Instant> = None;
+            let mut handshake_ok = false;
+            let mut pending_chunks: Vec<Vec<i16>> = Vec::new();
+            let mut audio_buffer: Vec<i16> = Vec::new();
+
+            loop {
+                let final_timeout = committed_at
+                    .map(|at| REALTIME_FINAL_WAIT.saturating_sub(at.elapsed()))
+                    .unwrap_or(Duration::from_secs(3600));
+
+                tokio::select! {
+                    command = rx.recv() => {
+                        match command {
+                            Some(RealtimeAsrCommand::Audio(samples)) => {
+                                if committed_at.is_none() {
+                                    if handshake_ok {
+                                        send_tencent_audio_samples(&mut ws, &mut audio_buffer, &samples, false).await?;
+                                    } else {
+                                        pending_chunks.push(samples);
+                                    }
+                                }
+                            }
+                            Some(RealtimeAsrCommand::Commit) => {
+                                if committed_at.is_none() {
+                                    committed_at = Some(Instant::now());
+                                    if handshake_ok {
+                                        for chunk in pending_chunks.drain(..) {
+                                            send_tencent_audio_samples(&mut ws, &mut audio_buffer, &chunk, false).await?;
+                                        }
+                                        send_tencent_audio_samples(&mut ws, &mut audio_buffer, &[], true).await?;
+                                    }
+                                    ws.send(Message::Text(json!({"type":"end"}).to_string().into()))
+                                        .await
+                                        .context("发送腾讯云 end 失败")?;
+                                }
+                            }
+                            Some(RealtimeAsrCommand::Cancel) => {
+                                let _ = ws.close(None).await;
+                                break;
+                            }
+                            None => {
+                                if committed_at.is_none() {
+                                    let _ = ws.close(None).await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    message = ws.next() => {
+                        match message {
+                            Some(Ok(Message::Text(text))) => {
+                                if !handshake_ok && is_tencent_handshake_success(&text)? {
+                                    handshake_ok = true;
+                                    for chunk in pending_chunks.drain(..) {
+                                        send_tencent_audio_samples(&mut ws, &mut audio_buffer, &chunk, false).await?;
+                                    }
+                                }
+                                if handle_tencent_message(&app, &session_id, &provider_id, &text, &mut best_text)? {
+                                    break;
+                                }
+                            }
+                            Some(Ok(Message::Binary(bytes))) => {
+                                if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                                    if !handshake_ok && is_tencent_handshake_success(&text)? {
+                                        handshake_ok = true;
+                                        for chunk in pending_chunks.drain(..) {
+                                            send_tencent_audio_samples(&mut ws, &mut audio_buffer, &chunk, false).await?;
+                                        }
+                                    }
+                                    if handle_tencent_message(&app, &session_id, &provider_id, &text, &mut best_text)? {
+                                        break;
+                                    }
+                                }
+                            }
+                            Some(Ok(Message::Close(_))) | None => {
+                                if !best_text.trim().is_empty() {
+                                    emit_best_text_as_final(&app, &session_id, &provider_id, &best_text);
+                                }
+                                break;
+                            }
+                            Some(Ok(_)) => {}
+                            Some(Err(err)) => {
+                                if !best_text.trim().is_empty() {
+                                    emit_best_text_as_final(&app, &session_id, &provider_id, &best_text);
+                                    break;
+                                }
+                                return Err(anyhow!("腾讯云实时 ASR 连接错误：{err}"));
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(final_timeout), if committed_at.is_some() => {
+                        emit_best_text_as_final(&app, &session_id, &provider_id, &best_text);
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = result {
+            emit_transcript_event(
+                &app,
+                &session_id,
+                "error",
+                "",
+                &provider_id,
+                Some(true),
+                Some(&err.to_string()),
+            );
+        }
+    });
+
+    Ok(tx)
+}
+
 async fn send_alibaba_finish_task<S>(ws: &mut S, task_id: &str) -> Result<()>
 where
     S: Sink<Message> + Unpin,
@@ -520,6 +689,113 @@ fn handle_alibaba_message(
         }
         _ => Ok(false),
     }
+}
+
+fn handle_tencent_message(
+    app: &AppHandle,
+    session_id: &str,
+    provider_id: &str,
+    text: &str,
+    best_text: &mut String,
+) -> Result<bool> {
+    let value: Value = serde_json::from_str(text).context("腾讯云实时 ASR 响应不是合法 JSON")?;
+    let code = value
+        .get("code")
+        .and_then(Value::as_i64)
+        .or_else(|| value.get("Code").and_then(Value::as_i64))
+        .unwrap_or(0);
+    if code != 0 {
+        let message = value
+            .get("message")
+            .or_else(|| value.get("Message"))
+            .and_then(Value::as_str)
+            .unwrap_or("腾讯云实时 ASR 返回错误");
+        emit_transcript_event(
+            app,
+            session_id,
+            "error",
+            "",
+            provider_id,
+            Some(true),
+            Some(message),
+        );
+        return Ok(true);
+    }
+
+    let transcript = value
+        .pointer("/result/voice_text_str")
+        .or_else(|| value.pointer("/Result/voice_text_str"))
+        .or_else(|| value.get("result"))
+        .or_else(|| value.get("Result"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if transcript.is_empty() || text_is_usable(transcript).is_err() {
+        return Ok(false);
+    }
+
+    *best_text = transcript.to_string();
+    let is_final = value
+        .get("final")
+        .or_else(|| value.get("Final"))
+        .and_then(Value::as_i64)
+        .is_some_and(|flag| flag != 0);
+    let slice_type = value
+        .pointer("/result/slice_type")
+        .or_else(|| value.pointer("/Result/slice_type"))
+        .or_else(|| value.get("slice_type"))
+        .or_else(|| value.get("sliceType"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let kind = if is_final || slice_type == 2 || provider_id == "tencent_realtime" {
+        "stable"
+    } else {
+        "partial"
+    };
+    emit_transcript_event(app, session_id, kind, best_text, provider_id, None, None);
+    if is_final {
+        emit_transcript_event(app, session_id, "final", best_text, provider_id, None, None);
+    }
+    Ok(is_final)
+}
+
+fn is_tencent_handshake_success(text: &str) -> Result<bool> {
+    let value: Value = serde_json::from_str(text).context("腾讯云实时 ASR 响应不是合法 JSON")?;
+    let code = value
+        .get("code")
+        .and_then(Value::as_i64)
+        .or_else(|| value.get("Code").and_then(Value::as_i64))
+        .unwrap_or(0);
+    Ok(code == 0 && value.get("result").is_none() && value.get("Result").is_none())
+}
+
+async fn send_tencent_audio_samples<S>(
+    ws: &mut S,
+    buffer: &mut Vec<i16>,
+    samples: &[i16],
+    force: bool,
+) -> Result<()>
+where
+    S: Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    const TENCENT_AUDIO_CHUNK_SAMPLES: usize = 16_000 / 5;
+    buffer.extend_from_slice(samples);
+    while buffer.len() >= TENCENT_AUDIO_CHUNK_SAMPLES {
+        let chunk = buffer
+            .drain(..TENCENT_AUDIO_CHUNK_SAMPLES)
+            .collect::<Vec<_>>();
+        ws.send(Message::Binary(pcm_i16_to_le_bytes(&chunk).into()))
+            .await
+            .context("发送腾讯云 200ms 音频分片失败")?;
+    }
+    if force && !buffer.is_empty() {
+        let chunk = std::mem::take(buffer);
+        ws.send(Message::Binary(pcm_i16_to_le_bytes(&chunk).into()))
+            .await
+            .context("发送腾讯云尾部音频分片失败")?;
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -770,11 +1046,79 @@ fn realtime_endpoint_or_default(endpoint: &str) -> String {
 
 fn alibaba_realtime_endpoint_or_default(endpoint: &str) -> String {
     let trimmed = endpoint.trim();
-    if trimmed.starts_with("wss://") || trimmed.starts_with("ws://") {
+    if (trimmed.starts_with("wss://") || trimmed.starts_with("ws://"))
+        && !trimmed.contains("asr.cloud.tencent.com")
+        && !trimmed.contains("api.stepfun.com")
+    {
         trimmed.to_string()
     } else {
         ALIBABA_PARA_FORMER_ENDPOINT.to_string()
     }
+}
+
+fn tencent_realtime_endpoint_or_default(endpoint: &str) -> String {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    if trimmed.is_empty()
+        || trimmed == ALIBABA_PARA_FORMER_ENDPOINT.trim_end_matches('/')
+        || trimmed == STEPFUN_STREAM_ENDPOINT.trim_end_matches('/')
+    {
+        TENCENT_REALTIME_ENDPOINT.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn build_tencent_realtime_url(
+    endpoint: &str,
+    app_id: &str,
+    secret_id: &str,
+    secret_key: &str,
+    model: &str,
+    voice_id: &str,
+) -> Result<String> {
+    let base = format!("{}/{}", endpoint.trim_end_matches('/'), app_id);
+    let timestamp = current_unix_secs();
+    let expired = timestamp + 3600;
+    let nonce = uuid::Uuid::new_v4().as_u128() % 1_000_000_000;
+    let params = vec![
+        ("engine_model_type", model.to_string()),
+        ("expired", expired.to_string()),
+        ("needvad", "1".to_string()),
+        ("nonce", nonce.to_string()),
+        ("secretid", secret_id.to_string()),
+        ("timestamp", timestamp.to_string()),
+        ("voice_format", "1".to_string()),
+        ("voice_id", voice_id.to_string()),
+    ];
+    let query_to_sign = params
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let host_and_path = base
+        .strip_prefix("wss://")
+        .or_else(|| base.strip_prefix("ws://"))
+        .ok_or_else(|| anyhow!("腾讯云 ASR endpoint 必须是 ws:// 或 wss://"))?;
+    let sign_source = format!("{host_and_path}?{query_to_sign}");
+    let mut mac =
+        Hmac::<Sha1>::new_from_slice(secret_key.as_bytes()).context("无法创建腾讯云 ASR 签名器")?;
+    mac.update(sign_source.as_bytes());
+    let signature = BASE64_STANDARD.encode(mac.finalize().into_bytes());
+    let encoded_signature = urlencoding::encode(&signature);
+    Ok(format!(
+        "{base}?{query_to_sign}&signature={encoded_signature}"
+    ))
+}
+
+fn tencent_voice_id() -> String {
+    format!("typelesss{}", uuid::Uuid::new_v4().simple())
+}
+
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn asr_hotword_prompt() -> &'static str {
@@ -786,6 +1130,9 @@ async fn transcribe_auto_optimized(config: &AppConfig, wav_path: &str) -> Result
     for candidate in auto_asr_candidates(config) {
         let result = match candidate.as_str() {
             "volcengine" => transcribe_volcengine_streaming(config, wav_path).await,
+            "tencent_realtime" => Err(anyhow!(
+                "腾讯云 realtime 未返回 final，停止后跳过 batch 重试"
+            )),
             "local_hybrid" => transcribe_local_hybrid(config, wav_path).await,
             "whisper_compatible" => transcribe_whisper_fallback(config, wav_path).await,
             "alibaba_paraformer_realtime" => Err(anyhow!(
@@ -829,6 +1176,7 @@ fn auto_asr_candidates(config: &AppConfig) -> Vec<String> {
         vec![
             "alibaba_paraformer_realtime".to_string(),
             "volcengine".to_string(),
+            "tencent_realtime".to_string(),
             "local_hybrid".to_string(),
             "whisper_compatible".to_string(),
         ]
@@ -840,6 +1188,12 @@ fn auto_asr_candidates(config: &AppConfig) -> Vec<String> {
             !config.volcengine_app_id.trim().is_empty()
                 && !config.volcengine_resource_id.trim().is_empty()
                 && !secret_store::resolve_volcengine_access_token(&config.volcengine_access_token)
+                    .trim()
+                    .is_empty()
+        } else if candidate == "tencent_realtime" {
+            !config.tencent_app_id.trim().is_empty()
+                && !config.tencent_secret_id.trim().is_empty()
+                && !secret_store::resolve_tencent_secret_key(&config.tencent_secret_key)
                     .trim()
                     .is_empty()
         } else if candidate == "whisper_compatible" {
@@ -1452,5 +1806,59 @@ mod tests {
             "我要使用 Claude Code 和 OpenAI Codex"
         );
         assert_eq!(acc.best_text(), "我要使用 Claude Code 和 OpenAI Codex");
+    }
+
+    #[test]
+    fn builds_tencent_realtime_signed_url() {
+        let url = build_tencent_realtime_url(
+            "wss://asr.cloud.tencent.com/asr/v2",
+            "123456",
+            "AKIDEXAMPLE",
+            "secret",
+            "16k_zh",
+            "voice-1",
+        )
+        .expect("signed url");
+        assert!(url.starts_with("wss://asr.cloud.tencent.com/asr/v2/123456?"));
+        assert!(url.contains("engine_model_type=16k_zh"));
+        assert!(url.contains("secretid=AKIDEXAMPLE"));
+        assert!(url.contains("voice_format=1"));
+        assert!(url.contains("signature="));
+    }
+
+    #[test]
+    fn tencent_voice_id_is_alphanumeric() {
+        let voice_id = tencent_voice_id();
+        assert!(voice_id.chars().all(|ch| ch.is_ascii_alphanumeric()));
+        assert!(voice_id.len() > 16);
+    }
+
+    #[test]
+    fn parses_tencent_realtime_result() {
+        let value = json!({
+            "code": 0,
+            "result": {
+                "voice_text_str": "能不能再快一点",
+                "slice_type": 2
+            }
+        });
+        assert_eq!(
+            value
+                .pointer("/result/voice_text_str")
+                .and_then(Value::as_str),
+            Some("能不能再快一点")
+        );
+    }
+
+    #[test]
+    fn detects_tencent_handshake_success() {
+        assert!(
+            is_tencent_handshake_success(r#"{"code":0,"message":"success","voice_id":"abc"}"#)
+                .unwrap()
+        );
+        assert!(
+            !is_tencent_handshake_success(r#"{"code":0,"result":{"voice_text_str":"你好"}}"#)
+                .unwrap()
+        );
     }
 }

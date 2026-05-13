@@ -8,7 +8,12 @@ export const stepfunRealtimeDefaults = {
 export const autoOptimizedDefaults = {
   endpoint: "wss://dashscope.aliyuncs.com/api-ws/v1/inference/",
   model: "paraformer-realtime-v2",
-  candidates: ["alibaba_paraformer_realtime", "volcengine", "local_hybrid", "whisper_compatible"],
+  candidates: ["alibaba_paraformer_realtime", "tencent_realtime", "volcengine", "local_hybrid", "whisper_compatible"],
+};
+
+export const tencentRealtimeDefaults = {
+  endpoint: "wss://asr.cloud.tencent.com/asr/v2",
+  model: "16k_zh",
 };
 
 export const localHybridDefaults = {
@@ -39,6 +44,9 @@ export const defaultConfig: AppConfig = {
   volcengineAppId: "",
   volcengineAccessToken: "",
   volcengineResourceId: "",
+  tencentAppId: "",
+  tencentSecretId: "",
+  tencentSecretKey: "",
   polishProvider: "openai_compatible",
   polishEndpoint: "https://api.deepseek.com/v1",
   polishApiKey: "",
@@ -118,6 +126,16 @@ export function normalizeAsrProviderConfig(config: AppConfig): AppConfig {
           : autoOptimizedDefaults.candidates,
       asrAutoBenchmarkEnabled: config.asrAutoBenchmarkEnabled ?? true,
       asrSaveBenchmarkAudio: config.asrSaveBenchmarkAudio ?? true,
+    };
+  }
+  if (config.asrProvider === "tencent_realtime") {
+    return {
+      ...config,
+      asrEndpoint: config.asrEndpoint.trim() || tencentRealtimeDefaults.endpoint,
+      asrModel:
+        !config.asrModel.trim() || config.asrModel.trim().toLowerCase() === "16k_zh_en"
+          ? tencentRealtimeDefaults.model
+          : config.asrModel,
     };
   }
   if (config.asrProvider === "local_hybrid") {

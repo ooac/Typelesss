@@ -74,6 +74,7 @@ pub async fn probe_asr(config: &AppConfig) -> ProbeResult {
         "auto_optimized" => probe_auto_optimized(config).await,
         "whisper_compatible" => probe_whisper_compatible(config).await,
         "volcengine" => probe_volcengine(config),
+        "tencent_realtime" => probe_tencent_realtime(config),
         "stepfun_streaming" => probe_stepfun_streaming(config),
         "local_hybrid" => probe_local_hybrid(config).await,
         other => ProbeResult::unknown(&format!("未知 ASR Provider：{other}")),
@@ -141,6 +142,17 @@ fn probe_volcengine(config: &AppConfig) -> ProbeResult {
     }
     // No public probe endpoint; report unknown rather than mistakenly down.
     ProbeResult::unknown("Volcengine 无公开探测路径")
+}
+
+fn probe_tencent_realtime(config: &AppConfig) -> ProbeResult {
+    let secret_key = secret_store::resolve_tencent_secret_key(&config.tencent_secret_key);
+    if config.tencent_app_id.trim().is_empty()
+        || config.tencent_secret_id.trim().is_empty()
+        || secret_key.trim().is_empty()
+    {
+        return ProbeResult::unconfigured("未配置腾讯云 AppID / SecretID / SecretKey");
+    }
+    ProbeResult::unknown("腾讯云实时 ASR 会在录音时建立 WebSocket 验证")
 }
 
 fn probe_stepfun_streaming(config: &AppConfig) -> ProbeResult {
@@ -216,6 +228,7 @@ pub struct SecretStatus {
     pub asr_api_key: bool,
     pub polish_api_key: bool,
     pub volcengine_access_token: bool,
+    pub tencent_secret_key: bool,
 }
 
 pub fn secret_status() -> SecretStatus {
@@ -223,6 +236,7 @@ pub fn secret_status() -> SecretStatus {
         asr_api_key: !secret_store::resolve_asr_api_key("").is_empty(),
         polish_api_key: !secret_store::resolve_polish_api_key("").is_empty(),
         volcengine_access_token: !secret_store::resolve_volcengine_access_token("").is_empty(),
+        tencent_secret_key: !secret_store::resolve_tencent_secret_key("").is_empty(),
     }
 }
 

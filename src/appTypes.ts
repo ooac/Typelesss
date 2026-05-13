@@ -6,6 +6,7 @@ export type AsrProvider =
   | "auto_optimized"
   | "whisper_compatible"
   | "volcengine"
+  | "tencent_realtime"
   | "stepfun_streaming"
   | "local_hybrid";
 export type PolishProvider = "openai_compatible" | "disabled";
@@ -29,6 +30,9 @@ export interface AppConfig {
   volcengineAppId: string;
   volcengineAccessToken: string;
   volcengineResourceId: string;
+  tencentAppId: string;
+  tencentSecretId: string;
+  tencentSecretKey: string;
   polishProvider: PolishProvider;
   polishEndpoint: string;
   polishApiKey: string;
@@ -57,6 +61,13 @@ export interface RecordingResult {
   durationMs: number;
   sampleRate: number;
   samples: number;
+  audioQuality: AudioQuality;
+}
+
+export interface AudioQuality {
+  rmsDb: number;
+  peak: number;
+  audibleRatio: number;
 }
 
 export interface CapsulePayload {

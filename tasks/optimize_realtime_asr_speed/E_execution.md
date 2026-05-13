@@ -353,3 +353,60 @@
 - ✅ `cargo check` 通过。
 - ✅ `cargo test` 通过，46 个测试全部通过。
 - ✅ `git diff --check` 通过。
+
+### 任务 #1.12：ASR final 复核与音频链路补强 ✅
+**状态**：已完成
+**时间**：2026-05-12 14:12 - 2026-05-12 14:36
+**执行者**：LD
+
+#### 实现结果
+- ✅ 新增 `FinalCandidateGuard`，实时 final 若明显短于 preview、只有标点或语言错判，不再直接插入。
+- ✅ `auto_optimized` 在 final 疑似截断时调用完整 WAV 复核，并在复核结果更完整时替换。
+- ✅ 阿里 realtime 默认改为低延迟断句参数：关闭语义断句，启用 `max_sentence_silence=2500`。
+- ✅ 录音结果新增 RMS、peak、audible ratio，前端可提示“音量偏低/有效语音过少”。
+- ✅ realtime chunker 在销毁时 flush 不满 40ms 的尾包，减少尾音丢失。
+- ✅ 增加段首 pre-roll 缓冲，长停顿后新语音段会补发最近音频上下文。
+- ✅ `run_provider_benchmark` 不再返回静态 0 分；缺少真实样本时报明确错误，有样本时对本地/火山/硅基候选做真实转写评分。
+
+#### 相关文件
+- `src/asr/finalCandidateGuard.ts`
+- `src/state/AppContext.tsx`
+- `src-tauri/src/recorder.rs`
+- `src-tauri/src/providers.rs`
+- `src-tauri/src/lib.rs`
+
+#### 验证
+- ✅ `npm test` 通过，29 个测试全部通过。
+- ✅ `npm run build` 通过。
+- ✅ `cargo fmt --check` 通过。
+- ✅ `cargo check` 通过。
+- ✅ `cargo test` 通过，48 个测试全部通过。
+- ✅ `git diff --check` 通过。
+
+### 任务 #1.13：腾讯云实时 ASR 候选接入 ✅
+**状态**：已完成
+**时间**：2026-05-12 15:08 - 2026-05-12 15:46
+**执行者**：LD
+
+#### 实现结果
+- ✅ 新增 `tencent_realtime` ASR provider，接入腾讯云实时识别 WebSocket。
+- ✅ 实现腾讯云 HMAC-SHA1 签名 URL，默认模型 `16k_zh_en`。
+- ✅ 解析腾讯云 `result`、`slice_type`、`final`，输出 partial/stable/final。
+- ✅ 配置增加腾讯云 AppID、SecretID、SecretKey，SecretKey 写入 macOS Keychain。
+- ✅ UI 增加“腾讯云实时 ASR”服务商和行内凭证编辑。
+- ✅ `auto_optimized` 默认候选加入腾讯云，顺序为阿里 → 腾讯 → 火山 → 本地 → 硅基。
+
+#### 相关文件
+- `src-tauri/src/providers.rs`
+- `src-tauri/src/app_config.rs`
+- `src-tauri/src/secret_store.rs`
+- `src/components/ProviderEditor.tsx`
+- `src/appDefaults.ts`
+
+#### 验证
+- ✅ `npm test` 通过，30 个测试全部通过。
+- ✅ `npm run build` 通过。
+- ✅ `cargo fmt --check` 通过。
+- ✅ `cargo check` 通过。
+- ✅ `cargo test` 通过，51 个测试全部通过。
+- ✅ `git diff --check` 通过。

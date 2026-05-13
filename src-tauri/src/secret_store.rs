@@ -5,15 +5,18 @@ const SERVICE: &str = "com.openless.realtime-input";
 const ASR_API_KEY: &str = "asr_api_key";
 const POLISH_API_KEY: &str = "polish_api_key";
 const VOLCENGINE_ACCESS_TOKEN: &str = "volcengine_access_token";
+const TENCENT_SECRET_KEY: &str = "tencent_secret_key";
 
 pub fn save_sensitive_values(
     asr_key: &str,
     polish_key: &str,
     volcengine_token: &str,
+    tencent_secret_key: &str,
 ) -> Result<()> {
     set_if_present(ASR_API_KEY, asr_key)?;
     set_if_present(POLISH_API_KEY, polish_key)?;
     set_if_present(VOLCENGINE_ACCESS_TOKEN, volcengine_token)?;
+    set_if_present(TENCENT_SECRET_KEY, tencent_secret_key)?;
     Ok(())
 }
 
@@ -27,6 +30,10 @@ pub fn resolve_polish_api_key(value: &str) -> String {
 
 pub fn resolve_volcengine_access_token(value: &str) -> String {
     resolve_secret(VOLCENGINE_ACCESS_TOKEN, value)
+}
+
+pub fn resolve_tencent_secret_key(value: &str) -> String {
+    resolve_secret(TENCENT_SECRET_KEY, value)
 }
 
 fn set_if_present(account: &str, value: &str) -> Result<()> {
@@ -55,6 +62,14 @@ fn normalize_secret_value(value: &str) -> String {
     let trimmed = value.trim();
     let decoded = decode_hex_if_needed(trimmed);
     let candidate = decoded.trim();
+    if !candidate.contains("sk-") {
+        return candidate
+            .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | '，' | ';' | '；'))
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+    }
     let key_start = candidate.find("sk-").unwrap_or(0);
     candidate[key_start..]
         .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | '，' | ';' | '；'))
@@ -98,5 +113,10 @@ mod tests {
             normalize_secret_value("736b2d76616c69642d746f6b656eefbc8c6d6f64656c"),
             "sk-valid-token"
         );
+    }
+
+    #[test]
+    fn keeps_non_openai_style_secret_key() {
+        assert_eq!(normalize_secret_value("abcDEF123+/=，备注"), "abcDEF123+/=");
     }
 }

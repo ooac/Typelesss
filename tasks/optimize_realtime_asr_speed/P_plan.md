@@ -15,6 +15,8 @@
 | 1.9 | Provider benchmark | 🟡 | 输出 first partial、final latency、CER/WER、技术词召回 |
 | 1.10 | Typeflux 对标本地多引擎 | ✅ | SenseVoice 默认、FunASR/Qwen 可选、Sherpa runtime/model 分离，一键下载启用 |
 | 1.11 | 国内云端 + 本地自动择优 | ✅ | `auto_optimized` 默认走阿里 realtime，失败后降级火山/本地/硅基 |
+| 1.12 | ASR final 复核与音频链路补强 | ✅ | 不盲信截断 final，尾包不丢，音频质量可诊断 |
+| 1.13 | 腾讯云实时 ASR 候选接入 | ✅ | 腾讯云 WebSocket realtime 可配置、可作为自动候选 |
 
 ## DoD
 - `npm run build` 通过。

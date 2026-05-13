@@ -19,6 +19,7 @@ import {
   autoOptimizedDefaults,
   localHybridDefaults,
   stepfunRealtimeDefaults,
+  tencentRealtimeDefaults,
   whisperCompatibleDefaults,
 } from "../appDefaults.js";
 import { useHealth } from "../health/HealthContext.js";
@@ -41,6 +42,7 @@ type EditorId =
   | "asrEndpoint"
   | "asrApiKey"
   | "volcengine"
+  | "tencent"
   | "polishProvider"
   | "polishEndpoint"
   | "polishApiKey"
@@ -53,6 +55,7 @@ const ASR_PROVIDER_LABEL: Record<AsrProvider, string> = {
   whisper_compatible: "硅基流动 / Whisper-compatible",
   stepfun_streaming: "StepFun 实时 ASR",
   volcengine: "Volcengine streaming",
+  tencent_realtime: "腾讯云实时 ASR",
 };
 
 const POLISH_PROVIDER_LABEL: Record<PolishProvider, string> = {
@@ -124,13 +127,17 @@ export function ProviderEditor({
   );
 
   const isAsrVolcengine = config.asrProvider === "volcengine";
+  const isAsrTencent = config.asrProvider === "tencent_realtime";
   const draftAsrIsVolcengine = draft.asrProvider === "volcengine";
+  const draftAsrIsTencent = draft.asrProvider === "tencent_realtime";
   const isLocalHybrid = config.asrProvider === "local_hybrid";
   const asrModelPlaceholder =
     draft.asrProvider === "local_hybrid"
       ? localHybridDefaults.model
       : draft.asrProvider === "auto_optimized"
         ? autoOptimizedDefaults.model
+      : draft.asrProvider === "tencent_realtime"
+        ? tencentRealtimeDefaults.model
       : draft.asrProvider === "stepfun_streaming"
         ? stepfunRealtimeDefaults.model
         : "FunAudioLLM/SenseVoiceSmall";
@@ -139,6 +146,8 @@ export function ProviderEditor({
       ? localHybridDefaults.endpoint
       : draft.asrProvider === "auto_optimized"
       ? autoOptimizedDefaults.endpoint
+      : draft.asrProvider === "tencent_realtime"
+      ? tencentRealtimeDefaults.endpoint
       : draft.asrProvider === "stepfun_streaming"
       ? stepfunRealtimeDefaults.endpoint
       : "https://api.siliconflow.cn/v1/audio/transcriptions";
@@ -290,6 +299,7 @@ export function ProviderEditor({
             options={[
               { value: "auto_optimized", label: ASR_PROVIDER_LABEL.auto_optimized },
               { value: "local_hybrid", label: ASR_PROVIDER_LABEL.local_hybrid },
+              { value: "tencent_realtime", label: ASR_PROVIDER_LABEL.tencent_realtime },
               { value: "stepfun_streaming", label: ASR_PROVIDER_LABEL.stepfun_streaming },
               { value: "whisper_compatible", label: ASR_PROVIDER_LABEL.whisper_compatible },
               { value: "volcengine", label: ASR_PROVIDER_LABEL.volcengine },
@@ -327,6 +337,15 @@ export function ProviderEditor({
                 });
                 return;
               }
+              if (provider === "tencent_realtime") {
+                setDraft({
+                  ...draft,
+                  asrProvider: provider,
+                  asrEndpoint: tencentRealtimeDefaults.endpoint,
+                  asrModel: tencentRealtimeDefaults.model,
+                });
+                return;
+              }
               if (provider === "whisper_compatible") {
                 setDraft({
                   ...draft,
@@ -358,6 +377,27 @@ export function ProviderEditor({
               value={draft.volcengineAccessToken}
               hasSavedSecret={secrets.volcengineAccessToken}
               onChange={(value) => setDraft({ ...draft, volcengineAccessToken: value })}
+            />
+          </>
+        ) : null}
+
+        {(id === "tencent" || (id === "asrProvider" && draftAsrIsTencent)) ? (
+          <>
+            <TextField
+              label="腾讯云 AppID"
+              value={draft.tencentAppId}
+              onChange={(value) => setDraft({ ...draft, tencentAppId: value })}
+            />
+            <TextField
+              label="腾讯云 SecretID"
+              value={draft.tencentSecretId}
+              onChange={(value) => setDraft({ ...draft, tencentSecretId: value })}
+            />
+            <SecretField
+              label="腾讯云 SecretKey"
+              value={draft.tencentSecretKey}
+              hasSavedSecret={secrets.tencentSecretKey}
+              onChange={(value) => setDraft({ ...draft, tencentSecretKey: value })}
             />
           </>
         ) : null}
@@ -481,6 +521,34 @@ export function ProviderEditor({
             onClick={() => void openEditor("volcengine")}
           />
           {renderInlineEditor("volcengine")}
+        </>
+      ) : isAsrTencent ? (
+        <>
+          <ProviderRow
+            icon={<Database size={16} />}
+            label="腾讯云凭证"
+            value={config.tencentAppId ? `AppID ${config.tencentAppId}` : "未配置"}
+            status={<HealthChip probe={asr} />}
+            expanded={editing === "tencent"}
+            onClick={() => void openEditor("tencent")}
+          />
+          {renderInlineEditor("tencent")}
+          <ProviderRow
+            icon={<Cpu size={16} />}
+            label="ASR 模型"
+            value={config.asrModel || tencentRealtimeDefaults.model}
+            expanded={editing === "asrModel"}
+            onClick={() => void openEditor("asrModel")}
+          />
+          {renderInlineEditor("asrModel")}
+          <ProviderRow
+            icon={<Link2 size={16} />}
+            label="ASR 接口"
+            value={truncateUrl(config.asrEndpoint || tencentRealtimeDefaults.endpoint)}
+            expanded={editing === "asrEndpoint"}
+            onClick={() => void openEditor("asrEndpoint")}
+          />
+          {renderInlineEditor("asrEndpoint")}
         </>
       ) : (
         <>

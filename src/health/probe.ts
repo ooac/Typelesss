@@ -14,6 +14,7 @@ export interface SecretStatus {
   asrApiKey: boolean;
   polishApiKey: boolean;
   volcengineAccessToken: boolean;
+  tencentSecretKey: boolean;
 }
 
 export async function probeAsr(config: AppConfig): Promise<ProbeResult> {

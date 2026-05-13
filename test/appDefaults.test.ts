@@ -76,4 +76,43 @@ describe("配置加载合并", () => {
     assert.deepEqual(config.asrProviderCandidates, autoOptimizedDefaults.candidates);
     assert.equal(config.hotkey, "RightOption");
   });
+
+  it("极速自动 ASR 不覆盖 preset 快捷键", () => {
+    const config = normalizeAsrProviderConfig({
+      ...defaultConfig,
+      hotkey: "RightOption",
+      activePresetId: "default",
+      presets: [
+        {
+          id: "default",
+          label: "默认",
+          hotkey: "RightOption",
+          outputMode: "smart_polish",
+        },
+      ],
+      asrProvider: "auto_optimized",
+      asrEndpoint: "",
+      asrModel: "",
+    });
+
+    assert.equal(config.hotkey, "RightOption");
+    assert.equal(config.presets[0]?.hotkey, "RightOption");
+    assert.equal(config.asrEndpoint, autoOptimizedDefaults.endpoint);
+  });
+
+  it("极速自动 ASR 默认包含腾讯云实时候选", () => {
+    assert.ok(autoOptimizedDefaults.candidates.includes("tencent_realtime"));
+  });
+
+  it("腾讯云实时 ASR 先强制使用 16k_zh 验证基础连通", () => {
+    const config = normalizeAsrProviderConfig({
+      ...defaultConfig,
+      asrProvider: "tencent_realtime",
+      asrEndpoint: "",
+      asrModel: "16k_zh_en",
+    });
+
+    assert.equal(config.asrEndpoint, "wss://asr.cloud.tencent.com/asr/v2");
+    assert.equal(config.asrModel, "16k_zh");
+  });
 });
